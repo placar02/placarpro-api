@@ -13,7 +13,7 @@ app.disable('x-powered-by');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-betleverage-key-2026';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5174';
-const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL || 'http://localhost:3001';
+const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL || 'https://placarpro-api-scraper.onrender.com';
 const MERCADOPAGO_API_URL = 'https://api.mercadopago.com';
 const BASIC_MAX_ODD = 1.5;
 const PREMIUM_ENTRY_LIMIT = 5;
