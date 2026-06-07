@@ -1,0 +1,36 @@
+{
+  "name": "abacatepay",
+  "version": "1.0.1",
+  "description": "CLI para adicionar servidor MCP do Abacate Pay em IDEs e clients",
+  "type": "module",
+  "bin": {
+    "abacatepay": "./bin/cli.js"
+  },
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mcp",
+    "abacatepay",
+    "cli",
+    "cursor",
+    "claude"
+  ],
+  "author": "viniciusameric",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/viniciusameric/abacatepay-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/viniciusameric/abacatepay-cli/issues"
+  },
+  "homepage": "https://github.com/viniciusameric/abacatepay-cli#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "commander": "^11.1.0"
+  }
+}
