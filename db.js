@@ -3,23 +3,18 @@ const dotenv = require('dotenv');
 
 dotenv.config();
 
-// Configuração para o PostgreSQL (ou H2 em modo PG)
-// O usuário pode sobrescrever a URL usando DATABASE_URL no .env
+const useDatabaseUrl = Boolean(process.env.DATABASE_URL);
+const useSsl = process.env.DB_SSL === 'true' || process.env.NODE_ENV === 'production';
+
 const pool = new Pool({
-  // connectionString: process.env.DATABASE_URL || 'postgresql://sa:sa@localhost:5432/placar02',
-   //Caso não use connectionString:
-  user: process.env.DB_USER || 'postgres',
-  host: process.env.DB_HOST || 'localhost',
-  database: process.env.DB_NAME || 'placar02',
-  password: process.env.DB_PASSWORD || 'sa',
-  port: process.env.DB_PORT || 5432, // 5432 is default for Postgres, 5435 for H2 PG server
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
-pool.on('error', (err) => {
-  console.error('Erro no pool do banco de dados:', err);
-});
+module.exports = pool;
 
-// Inicialização das tabelas
 async function initDb() {
   try {
     await pool.query(`
@@ -35,8 +30,8 @@ async function initDb() {
       )
     `);
 
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banca_inicial REAL DEFAULT 0`);
-    await pool.query(`ALTER TABLE users ALTER COLUMN saldo_atual SET DEFAULT 0`);
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS banca_inicial REAL DEFAULT 0');
+    await pool.query('ALTER TABLE users ALTER COLUMN saldo_atual SET DEFAULT 0');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bets (
@@ -52,9 +47,9 @@ async function initDb() {
       )
     `);
 
-    await pool.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS event_id VARCHAR(100)`);
-    await pool.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS market TEXT`);
-    await pool.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS recommendation TEXT`);
+    await pool.query('ALTER TABLE bets ADD COLUMN IF NOT EXISTS event_id VARCHAR(100)');
+    await pool.query('ALTER TABLE bets ADD COLUMN IF NOT EXISTS market TEXT');
+    await pool.query('ALTER TABLE bets ADD COLUMN IF NOT EXISTS recommendation TEXT');
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bankroll_history (
@@ -92,33 +87,31 @@ async function initDb() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    
-    console.log('Tabelas inicializadas (PostgreSQL / H2).');
+
+    console.log('Tabelas inicializadas (PostgreSQL).');
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err);
   }
 }
 
-// Chamar a inicialização
 initDb();
 
-// Função utilitária para converter queries com '?' (SQLite) para '$1, $2...' (PostgreSQL)
 const convertSql = (sql) => {
   let i = 1;
   return sql.replace(/\?/g, () => `$${i++}`);
 };
 
-// Funções utilitárias mantidas para compatibilidade com o server.js
 const run = async (sql, params = []) => {
   const pgSql = convertSql(sql);
   let finalSql = pgSql;
+
   if (sql.trim().toUpperCase().startsWith('INSERT') && !sql.toUpperCase().includes('RETURNING')) {
     finalSql += ' RETURNING id';
   }
-  
+
   const res = await pool.query(finalSql, params);
   const id = res.rows.length > 0 ? res.rows[0].id : null;
-  
+
   return { id, changes: res.rowCount };
 };
 
