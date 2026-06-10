@@ -4,6 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "start:local": "powershell -ExecutionPolicy Bypass -File ./start-local.ps1",
     "check": "node --check server.js",
     "build": "npm run check",
     "test": "npm run check"

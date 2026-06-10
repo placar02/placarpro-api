@@ -12,8 +12,8 @@ const app = express();
 app.disable('x-powered-by');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-betleverage-key-2026';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5174';
-const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL || 'https://placarpro-api-scraper.onrender.com';
+const FRONTEND_URL = process.env.FRONTEND_URL ;
+const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL ;
 const MERCADOPAGO_API_URL = 'https://api.mercadopago.com';
 const BASIC_MAX_ODD = 1.5;
 const PREMIUM_ENTRY_LIMIT = 5;
@@ -251,6 +251,12 @@ const getLocalDateKey = (date = new Date()) => new Intl.DateTimeFormat('en-CA', 
   day: '2-digit',
 }).format(date);
 
+const getLocalDateKeyOffset = (days = 0) => {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return getLocalDateKey(date);
+};
+
 const getEventStartTimestamp = (event) => Number(event?.startTimestamp || event?.startTime || 0);
 
 const getEventDateKey = (event) => {
@@ -289,8 +295,22 @@ const isTodayUpcomingEvent = (event) => {
   return timestamp * 1000 > Date.now() - 5 * 60 * 1000;
 };
 
+const isUpcomingEvent = (event) => {
+  if (!event?.id) return false;
+  if (isFinishedStatus(event) || isLiveStatus(event)) return false;
+
+  const timestamp = getEventStartTimestamp(event);
+  if (!timestamp) return false;
+
+  return timestamp * 1000 > Date.now() - 5 * 60 * 1000;
+};
+
 const filterEligibleDailyEvents = (events = []) => events
   .filter(isTodayUpcomingEvent)
+  .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
+
+const filterUpcomingEvents = (events = []) => events
+  .filter(isUpcomingEvent)
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
 const normalizeEntry = (entry, events = []) => {
@@ -416,11 +436,52 @@ const mercadoPagoRequest = async (method, path, data, params, extraHeaders = {})
 
 const getMercadoPagoErrorMessage = (err) => {
   const apiError = err.response?.data;
+  const causeText = Array.isArray(apiError?.cause)
+    ? apiError.cause.map((item) => item.description).filter(Boolean).join(' ')
+    : '';
+
+  if (causeText.includes('Invalid card_token_id')) {
+    return 'Token do cartao invalido, expirado ou ja usado. Gere um novo token preenchendo o formulario de cartao novamente.';
+  }
+
   if (typeof apiError?.message === 'string') return apiError.message;
   if (typeof apiError?.error === 'string') return apiError.error;
   if (typeof apiError === 'string') return apiError;
   return err.message || 'Erro desconhecido no Mercado Pago';
 };
+
+const getMercadoPagoErrorDetails = (err) => {
+  const apiError = err.response?.data;
+  const cause = Array.isArray(apiError?.cause)
+    ? apiError.cause.map((item) => [item.code, item.description].filter(Boolean).join(': ')).filter(Boolean)
+    : [];
+
+  return {
+    status: err.response?.status,
+    message: getMercadoPagoErrorMessage(err),
+    cause,
+    raw: apiError,
+  };
+};
+
+const sanitizeMercadoPagoPayload = (payload = {}) => ({
+  transaction_amount: payload.transaction_amount,
+  description: payload.description,
+  installments: payload.installments,
+  payment_method_id: payload.payment_method_id,
+  issuer_id: payload.issuer_id,
+  external_reference: payload.external_reference,
+  payer: payload.payer ? {
+    email: payload.payer.email,
+    identification: payload.payer.identification ? {
+      type: payload.payer.identification.type,
+      number: payload.payer.identification.number ? '***' : undefined,
+    } : undefined,
+  } : undefined,
+  metadata: payload.metadata,
+  has_token: Boolean(payload.token),
+  has_notification_url: Boolean(payload.notification_url),
+});
 
 const isPublicHttpsUrl = (value) => {
   try {
@@ -470,9 +531,29 @@ const findMercadoPagoPaymentByExternalId = async (externalId) => {
   return results[0] || null;
 };
 
-const getPaymentNotificationUrl = () => process.env.MERCADOPAGO_WEBHOOK_URL || (
-  process.env.PUBLIC_API_URL ? `${process.env.PUBLIC_API_URL}/api/payments/webhook` : undefined
+const getPaymentNotificationUrl = () => {
+  if (isPublicHttpsUrl(process.env.MERCADOPAGO_WEBHOOK_URL)) {
+    return process.env.MERCADOPAGO_WEBHOOK_URL;
+  }
+
+  const fallbackUrl = process.env.PUBLIC_API_URL
+    ? `${process.env.PUBLIC_API_URL}/api/payments/webhook`
+    : undefined;
+
+  return isPublicHttpsUrl(fallbackUrl) ? fallbackUrl : undefined;
+};
+
+const isMercadoPagoTestMode = () => (
+  String(process.env.MERCADOPAGO_ACCESS_TOKEN || '').startsWith('TEST-')
+  || String(process.env.MERCADOPAGO_PUBLIC_KEY || '').startsWith('TEST-')
 );
+
+const getMercadoPagoPayerEmail = (preferredEmail, fallbackEmail) => {
+  const testBuyerEmail = String(process.env.MERCADOPAGO_TEST_BUYER_EMAIL || '').trim();
+  if (isMercadoPagoTestMode() && testBuyerEmail) return testBuyerEmail;
+
+  return preferredEmail || fallbackEmail;
+};
 
 const fetchEventOdds = async (eventId) => {
   try {
@@ -486,17 +567,21 @@ const fetchEventOdds = async (eventId) => {
 
 const fetchDailyAnalysis = async () => {
   let events = [];
+  let eligibleEvents = [];
 
-  try {
-    const today = getLocalDateKey();
-    const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${today}`, { timeout: 20000 });
-    events = matchesRes.data.data || [];
-  } catch (err) {
-    console.warn('Nao foi possivel buscar jogos de hoje para a aposta do dia:', err.message);
-    return { selectedEvents: [], analysisResult: null };
+  for (const offset of [0, 1, 2]) {
+    const date = getLocalDateKeyOffset(offset);
+
+    try {
+      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 20000 });
+      events = matchesRes.data.data || [];
+      eligibleEvents = offset === 0 ? filterEligibleDailyEvents(events) : filterUpcomingEvents(events);
+
+      if (eligibleEvents.length > 0) break;
+    } catch (err) {
+      console.warn(`Nao foi possivel buscar jogos de ${date} para a aposta do dia:`, err.message);
+    }
   }
-
-  const eligibleEvents = filterEligibleDailyEvents(events);
 
   if (eligibleEvents.length === 0) {
     return { selectedEvents: [], analysisResult: null };
@@ -610,10 +695,12 @@ const refreshDailyPick = async () => {
 };
 
 const hasAiAnalysis = (cache) => {
-  const selectedEvents = filterEligibleDailyEvents(cache?.data?.selectedEvents || []);
+  const selectedEvents = filterUpcomingEvents(cache?.data?.selectedEvents || []);
   if (!cache?.data?.analysisResult || selectedEvents.length === 0) return false;
   return selectVariedEntries(cache.data.analysisResult, selectedEvents, PREMIUM_ENTRY_LIMIT).length > 0;
 };
+
+const hasDailyPickEvents = (cache) => filterUpcomingEvents(cache?.data?.selectedEvents || []).length > 0;
 
 const ensureDailyPick = async ({ requireAnalysis = false } = {}) => {
   const cacheKey = getDailyPickCacheKey();
@@ -622,13 +709,14 @@ const ensureDailyPick = async ({ requireAnalysis = false } = {}) => {
     dailyPickRuntimeCache?.cacheKey === cacheKey
     && dailyPickRuntimeCache.data
     && isCacheFresh(dailyPickRuntimeCache)
+    && hasDailyPickEvents(dailyPickRuntimeCache)
     && (!requireAnalysis || hasAiAnalysis(dailyPickRuntimeCache))
   ) {
     return dailyPickRuntimeCache;
   }
 
   const persisted = await readPersistedDailyPick();
-  if (persisted?.data && isCacheFresh(persisted) && (!requireAnalysis || hasAiAnalysis(persisted))) {
+  if (persisted?.data && isCacheFresh(persisted) && hasDailyPickEvents(persisted) && (!requireAnalysis || hasAiAnalysis(persisted))) {
     dailyPickRuntimeCache = persisted;
     return dailyPickRuntimeCache;
   }
@@ -637,7 +725,7 @@ const ensureDailyPick = async ({ requireAnalysis = false } = {}) => {
 };
 
 const buildDailyPickPayload = (plan, cache = dailyPickRuntimeCache) => {
-  const selectedEvents = filterEligibleDailyEvents(cache?.data?.selectedEvents || []);
+  const selectedEvents = filterUpcomingEvents(cache?.data?.selectedEvents || []);
   const analysisResult = selectedEvents.length ? cache?.data?.analysisResult : null;
   let apostaDoDia = null;
   let entradasPremium = [];
@@ -674,9 +762,13 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/payments/config', authenticateToken, (_req, res) => {
+  const testMode = isMercadoPagoTestMode();
+
   res.json({
     publicKey: process.env.MERCADOPAGO_PUBLIC_KEY || '',
     amount: PREMIUM_PLAN_PRICE_BRL,
+    testMode,
+    testBuyerEmail: testMode ? (String(process.env.MERCADOPAGO_TEST_BUYER_EMAIL || '').trim() || null) : null,
     allowTestApproval: process.env.ALLOW_PAYMENT_TEST_APPROVAL === 'true',
   });
 });
@@ -1090,6 +1182,17 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     const externalId = `premium-card-${req.user.id}-${Date.now()}`;
     const notificationUrl = getPaymentNotificationUrl();
     const user = await get('SELECT email, nome FROM users WHERE id = ?', [req.user.id]);
+    const payer = {
+      email: getMercadoPagoPayerEmail(cardholderEmail, user?.email || req.user.email),
+    };
+
+    if (identificationType && identificationNumber) {
+      payer.identification = {
+        type: identificationType,
+        number: String(identificationNumber).replace(/\D/g, ''),
+      };
+    }
+
     const paymentPayload = {
       transaction_amount: PREMIUM_PLAN_PRICE_BRL,
       description: process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
@@ -1097,9 +1200,7 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       installments,
       payment_method_id: paymentMethodId,
       external_reference: externalId,
-      payer: {
-        email: cardholderEmail || user?.email || req.user.email,
-      },
+      payer,
       metadata: {
         userId: String(req.user.id),
         plan: 'premium',
@@ -1107,14 +1208,12 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       },
     };
 
-    if (issuerId) paymentPayload.issuer_id = issuerId;
-    if (identificationType && identificationNumber) {
-      paymentPayload.payer.identification = {
-        type: identificationType,
-        number: identificationNumber,
-      };
+    if (issuerId && String(issuerId).toLowerCase() !== 'undefined') {
+      paymentPayload.issuer_id = issuerId;
     }
     if (notificationUrl) paymentPayload.notification_url = notificationUrl;
+
+    console.info('Payload Mercado Pago cartao:', sanitizeMercadoPagoPayload(paymentPayload));
 
     const payment = await mercadoPagoRequest(
       'POST',
@@ -1141,10 +1240,16 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     const details = getMercadoPagoErrorMessage(err);
-    console.error('Erro no pagamento por cartao Mercado Pago:', err.response?.data || err.message);
+    const mpDetails = getMercadoPagoErrorDetails(err);
+    console.error('Erro no pagamento por cartao Mercado Pago:', {
+      response: err.response?.data || err.message,
+      requestId: err.response?.headers?.['x-request-id'] || err.response?.headers?.['x-correlation-id'],
+      status: err.response?.status,
+    });
     res.status(500).json({
       error: `Erro ao processar cartao com Mercado Pago: ${details}`,
       details,
+      mercadoPago: mpDetails,
     });
   }
 });
@@ -1269,6 +1374,11 @@ const server = app.listen(PORT, () => {
 });
 
 server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Porta ${PORT} ja esta em uso. Feche a API antiga ou rode: npm run start:local`);
+    process.exit(1);
+  }
+
   console.error('Erro ao iniciar servidor:', err.message);
   process.exitCode = 1;
 });
