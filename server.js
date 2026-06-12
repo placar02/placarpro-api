@@ -411,6 +411,62 @@ const selectBasicEntry = (analysisResult, events) => {
   return candidates[0] || null;
 };
 
+const buildFallbackAnalysisFromEvents = (events = []) => {
+  const analyses = events.map((event) => {
+    const fallbackOdds = Array.isArray(event.fallbackOdds) ? event.fallbackOdds : [];
+    const firstOdd = fallbackOdds.find((item) => Number(item?.odd) > 1);
+    const market = firstOdd?.market || 'Pre-jogo';
+    const recommendation = firstOdd?.recommendation || 'Acompanhar mercado antes da entrada';
+
+    return {
+      eventId: event.id,
+      confidence: firstOdd?.odd ? 58 : 45,
+      market,
+      recommendation,
+      rationale: firstOdd?.odd
+        ? 'Entrada gerada por fallback de calendario e odds alternativas porque o provedor principal bloqueou a consulta.'
+        : 'Jogo encontrado por fallback de calendario. Odds reais nao vieram do provedor alternativo, entao registre somente apos confirmar a cotacao manualmente.',
+      meta: firstOdd?.odd ? {
+        decimal_odds: firstOdd.odd,
+        oddsMatchedBy: 'fallback-provider',
+      } : {
+        oddsMatchedBy: 'unavailable',
+      },
+      bestEntry: {
+        market,
+        recommendation,
+        confidence: firstOdd?.odd ? 58 : 45,
+        rationale: firstOdd?.odd
+          ? 'Entrada gerada por fallback de calendario e odds alternativas porque o provedor principal bloqueou a consulta.'
+          : 'Jogo encontrado por fallback de calendario. Odds reais nao vieram do provedor alternativo, entao registre somente apos confirmar a cotacao manualmente.',
+        meta: firstOdd?.odd ? {
+          decimal_odds: firstOdd.odd,
+          oddsMatchedBy: 'fallback-provider',
+        } : {
+          oddsMatchedBy: 'unavailable',
+        },
+      },
+    };
+  });
+
+  if (analyses.length === 0) return null;
+
+  return {
+    ...analyses[0],
+    bestEntry: analyses[0].bestEntry,
+    recommendations: analyses.map((analysis) => ({
+      eventId: analysis.eventId,
+      market: analysis.market,
+      recommendation: analysis.recommendation,
+      confidence: analysis.confidence,
+      rationale: analysis.rationale,
+      meta: analysis.meta,
+    })),
+    analyses,
+    analysisSource: 'fallback-provider',
+  };
+};
+
 const isPaidStatus = (status) => ['PAID', 'COMPLETED', 'APPROVED', 'approved'].includes(String(status || '').toUpperCase());
 
 const mercadoPagoRequest = async (method, path, data, params, extraHeaders = {}) => {
@@ -565,29 +621,71 @@ const fetchEventOdds = async (eventId) => {
   }
 };
 
+const buildFallbackOddsFromOddsData = (oddsData) => flattenOddsChoices(oddsData)
+  .slice(0, 8)
+  .map((choice) => ({
+    market: choice.marketName || 'Odds',
+    recommendation: choice.choiceName || 'Entrada',
+    odd: choice.decimalOdd,
+  }));
+
+const enrichEventsWithOdds = async (events = [], limit = 100) => {
+  const candidates = events.slice(0, limit);
+
+  const enriched = await Promise.all(candidates.map(async (event) => {
+    const oddsData = await fetchEventOdds(event.id);
+    const fallbackOdds = buildFallbackOddsFromOddsData(oddsData);
+
+    return {
+      ...event,
+      fallbackOdds,
+      hasRealOdds: fallbackOdds.some((item) => Number(item.odd) > 1),
+    };
+  }));
+
+  return [
+    ...enriched.filter((event) => event.hasRealOdds),
+    ...enriched.filter((event) => !event.hasRealOdds),
+    ...events.slice(limit),
+  ];
+};
+
 const fetchDailyAnalysis = async () => {
   let events = [];
   let eligibleEvents = [];
+  const fetchErrors = [];
 
   for (const offset of [0, 1, 2]) {
     const date = getLocalDateKeyOffset(offset);
 
     try {
-      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 20000 });
+      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 20000 }); ///////////
+      const upstreamStatus = Number(matchesRes.data?.status || matchesRes.status);
+
+      if (upstreamStatus >= 400) {
+        throw new Error(`scraper retornou status ${upstreamStatus}`);
+      }
+
       events = matchesRes.data.data || [];
       eligibleEvents = offset === 0 ? filterEligibleDailyEvents(events) : filterUpcomingEvents(events);
 
       if (eligibleEvents.length > 0) break;
     } catch (err) {
+      fetchErrors.push(`${date}: ${err.message}`);
       console.warn(`Nao foi possivel buscar jogos de ${date} para a aposta do dia:`, err.message);
     }
   }
 
   if (eligibleEvents.length === 0) {
+    if (fetchErrors.length > 0) {
+      throw new Error(`Nao foi possivel buscar jogos para gerar entradas (${fetchErrors.join(' | ')})`);
+    }
+
     return { selectedEvents: [], analysisResult: null };
   }
 
-  const selectedEvents = eligibleEvents.slice(0, PREMIUM_ENTRY_LIMIT);
+  const oddsAwareEvents = await enrichEventsWithOdds(eligibleEvents);
+  const selectedEvents = oddsAwareEvents.slice(0, PREMIUM_ENTRY_LIMIT);
 
   try {
     const analyses = await Promise.all(selectedEvents.map(async (event) => {
@@ -611,6 +709,7 @@ const fetchDailyAnalysis = async () => {
       }
     }));
     const validAnalyses = analyses.filter(Boolean).sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+    const fallbackAnalysis = validAnalyses.length ? null : buildFallbackAnalysisFromEvents(selectedEvents);
 
     return {
       selectedEvents,
@@ -618,16 +717,16 @@ const fetchDailyAnalysis = async () => {
         ...validAnalyses[0],
         bestEntry: validAnalyses[0].bestEntry || validAnalyses[0],
         analyses: validAnalyses,
-      } : null,
+      } : fallbackAnalysis,
     };
   } catch (err) {
     console.warn('Analise individual dos jogos de hoje falhou:', err.message);
-    return { selectedEvents, analysisResult: null };
+    return { selectedEvents, analysisResult: buildFallbackAnalysisFromEvents(selectedEvents) };
   }
 };
 
 const getDailyPickCacheKey = () => {
-  return `daily-pick-v10:${getLocalDateKey()}`;
+  return `daily-pick-v13:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
 };
 
 const isCacheFresh = (cache) => Boolean(cache?.updatedAt) && Date.now() - cache.updatedAt < DAILY_PICK_CACHE_TTL_MS;
