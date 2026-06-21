@@ -190,7 +190,9 @@ const enrichEntryWithOdds = (entry, oddsData) => {
   const ranked = choices
     .map((choice) => ({ choice, score: scoreOddChoice(entry, choice) }))
     .sort((a, b) => b.score - a.score || a.choice.decimalOdd - b.choice.decimalOdd);
-  const best = ranked[0]?.score > 0 ? ranked[0].choice : choices[0];
+  const best = ranked[0]?.score >= 3 ? ranked[0].choice : null;
+
+  if (!best) return entry;
 
   return {
     ...entry,
@@ -318,13 +320,28 @@ const normalizeEntry = (entry, events = []) => {
 
   const entryEventId = entry.eventId || (events.length === 1 ? events[0]?.id : null);
   const matchedEvent = events.find((event) => String(event.id) === String(entryEventId));
+  const fullRationale = String(entry.rationale || '').trim();
 
   return {
     ...entry,
     eventId: entryEventId,
     odd: extractOdd(entry),
-    rationale: summarizeText(entry.rationale),
-    analysisSummary: summarizeText(entry.rationale),
+    fullRationale,
+    rationale: summarizeText(fullRationale),
+    analysisSummary: summarizeText(fullRationale),
+    advancedAnalysis: {
+      dataCoverage: entry.dataCoverage || null,
+      keyFactors: Array.isArray(entry.keyFactors) ? entry.keyFactors : [],
+      playerAnalysis: entry.playerAnalysis || null,
+      refereeAnalysis: entry.refereeAnalysis || null,
+      marketBreakdown: entry.marketBreakdown || null,
+      confidenceDrivers: Array.isArray(entry.confidenceDrivers) ? entry.confidenceDrivers : [],
+      avoidMarkets: Array.isArray(entry.avoidMarkets) ? entry.avoidMarkets : [],
+      riskAnalysis: entry.riskAnalysis || null,
+      dataSupport: Array.isArray(entry.dataSupport) ? entry.dataSupport : [],
+      warningSigns: Array.isArray(entry.warningSigns) ? entry.warningSigns : [],
+      riskLevel: entry.riskLevel || null,
+    },
     homeTeamName: matchedEvent?.homeTeam?.name || entry.homeTeamName || 'Casa',
     awayTeamName: matchedEvent?.awayTeam?.name || entry.awayTeamName || 'Fora',
     tournamentName: matchedEvent?.tournament?.name || entry.tournamentName || 'Desconhecido',
@@ -659,7 +676,7 @@ const fetchDailyAnalysis = async () => {
     const date = getLocalDateKeyOffset(offset);
 
     try {
-      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 20000 }); ///////////
+      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 60000 }); ///////////
       const upstreamStatus = Number(matchesRes.data?.status || matchesRes.status);
 
       if (upstreamStatus >= 400) {
@@ -691,7 +708,7 @@ const fetchDailyAnalysis = async () => {
     const analyses = await Promise.all(selectedEvents.map(async (event) => {
       try {
         const analysisRes = await axios.get(
-          `${PLACARPRO_API_URL}/analysis/${event.id}?includeOdds=true&useOddsFallback=true`,
+          `${PLACARPRO_API_URL}/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
           { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
         );
         const analysis = analysisRes.data?.result;
@@ -726,7 +743,7 @@ const fetchDailyAnalysis = async () => {
 };
 
 const getDailyPickCacheKey = () => {
-  return `daily-pick-v13:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
+  return `daily-pick-v18:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
 };
 
 const isCacheFresh = (cache) => Boolean(cache?.updatedAt) && Date.now() - cache.updatedAt < DAILY_PICK_CACHE_TTL_MS;
