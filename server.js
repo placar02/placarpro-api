@@ -20,11 +20,13 @@ const PREMIUM_ENTRY_LIMIT = 5;
 const PREMIUM_PLAN_PRICE = Number(process.env.PREMIUM_PLAN_PRICE_CENTS || 4990);
 const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
-const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 30000);
+const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
+const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
 const DAILY_PICK_CACHE_TTL_MS = Number(process.env.DAILY_PICK_CACHE_TTL_MS || 15 * 60 * 1000);
+const ENABLE_ODDS_ENRICHMENT = process.env.ENABLE_ODDS_ENRICHMENT === 'true';
 
-let dailyPickRefreshPromise = null;
-let dailyPickRuntimeCache = null;
+const dailyPickRefreshPromises = new Map();
+const dailyPickRuntimeCaches = new Map();
 
 const allowedOrigins = (process.env.CORS_ORIGINS || `${FRONTEND_URL},http://localhost:5173,http://localhost:5174,http://localhost:5175`)
   .split(',')
@@ -222,6 +224,23 @@ const hasRealOddEntry = (analysisResult, events = []) => {
   return expandRecommendations(analysisResult, events).some((entry) => Number.isFinite(Number(entry.odd)) && Number(entry.odd) > 1);
 };
 
+const isFallbackEntry = (entry) => {
+  const text = normalizeOddText(`${entry?.market || ''} ${entry?.recommendation || ''} ${entry?.rationale || ''}`);
+  const oddsSource = String(entry?.meta?.oddsMatchedBy || entry?.bestEntry?.meta?.oddsMatchedBy || '');
+  return entry?.analysisSource === 'fallback-provider'
+    || oddsSource === 'fallback-provider'
+    || oddsSource === 'unavailable'
+    || text.includes('fallback de calendario')
+    || text.includes('acompanhar mercado antes da entrada');
+};
+
+const isUsableAnalysis = (analysis) => {
+  if (!analysis || analysis.analysisSource === 'fallback-provider') return false;
+  if (String(analysis.recommendation || '').toLowerCase() === 'error') return false;
+  if (Number(analysis.confidence || 0) <= 0) return false;
+  return true;
+};
+
 const summarizeText = (text, maxLength = 220) => {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
@@ -237,13 +256,15 @@ const getLiveMinute = (event) => {
   const statusType = String(event?.status?.type || '').toLowerCase();
   if (!['inprogress', 'live'].includes(statusType)) return null;
 
-  const periodStart = Number(event?.time?.currentPeriodStartTimestamp || event?.currentPeriodStartTimestamp || 0);
-  if (!periodStart) return null;
+  const explicitMinute = Number(event?.liveMinute || event?.currentTime || event?.time?.current || event?.time?.minute || 0);
+  if (Number.isFinite(explicitMinute) && explicitMinute > 0) return Math.min(Math.floor(explicitMinute), 130);
 
+  const periodStart = Number(event?.time?.currentPeriodStartTimestamp || event?.currentPeriodStartTimestamp || getEventStartTimestamp(event) || 0);
+  if (!periodStart) return null;
   const elapsed = Math.max(1, Math.floor((Date.now() / 1000 - periodStart) / 60));
   const max = Number(event?.time?.max || 90);
   const extra = Number(event?.time?.extra || 0);
-  return Math.min(elapsed, max + extra);
+  return Math.min(elapsed, Math.max(max + extra, 130));
 };
 
 const getLocalDateKey = (date = new Date()) => new Intl.DateTimeFormat('en-CA', {
@@ -315,12 +336,25 @@ const filterUpcomingEvents = (events = []) => events
   .filter(isUpcomingEvent)
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
+const normalizeMatchMode = (value) => String(value || '').toLowerCase() === 'live' ? 'live' : 'prelive';
+
+const filterLiveEvents = (events = []) => events
+  .filter((event) => event?.id && isLiveStatus(event) && !isFinishedStatus(event))
+  .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
+
+const filterEventsForMode = (events = [], mode = 'prelive') => {
+  return normalizeMatchMode(mode) === 'live' ? filterLiveEvents(events) : filterUpcomingEvents(events);
+};
+
 const normalizeEntry = (entry, events = []) => {
   if (!entry) return null;
+  if (!entry.recommendation && !entry.market && !entry.bestEntry) return null;
 
   const entryEventId = entry.eventId || (events.length === 1 ? events[0]?.id : null);
   const matchedEvent = events.find((event) => String(event.id) === String(entryEventId));
   const fullRationale = String(entry.rationale || '').trim();
+  const liveMinute = getLiveMinute(matchedEvent) || entry.liveMinute || null;
+  const statusType = String(matchedEvent?.status?.type || entry.status?.type || '').toLowerCase();
 
   return {
     ...entry,
@@ -347,7 +381,11 @@ const normalizeEntry = (entry, events = []) => {
     tournamentName: matchedEvent?.tournament?.name || entry.tournamentName || 'Desconhecido',
     startTimestamp: matchedEvent?.startTimestamp || entry.startTimestamp || null,
     status: matchedEvent?.status || entry.status || null,
-    liveMinute: getLiveMinute(matchedEvent) || entry.liveMinute || null,
+    liveMinute,
+    matchMode: ['inprogress', 'live'].includes(statusType) ? 'live' : 'prelive',
+    liveContext: ['inprogress', 'live'].includes(statusType)
+      ? `Ao vivo${liveMinute ? ` - ${liveMinute}'` : ''}`
+      : null,
     score: matchedEvent ? {
       home: matchedEvent.homeScore?.display ?? matchedEvent.homeScore?.current ?? null,
       away: matchedEvent.awayScore?.display ?? matchedEvent.awayScore?.current ?? null,
@@ -387,7 +425,8 @@ const expandRecommendations = (analysisResult, events) => {
 const selectVariedEntries = (analysisResult, events, limit = PREMIUM_ENTRY_LIMIT) => {
   const eventIds = new Set(events.map((event) => String(event.id)));
   const expanded = expandRecommendations(analysisResult, events)
-    .filter((entry) => eventIds.has(String(entry.eventId)));
+    .filter((entry) => eventIds.has(String(entry.eventId)))
+    .filter((entry) => !isFallbackEntry(entry));
   const byEvent = new Map();
 
   for (const entry of expanded) {
@@ -420,7 +459,8 @@ const selectVariedEntries = (analysisResult, events, limit = PREMIUM_ENTRY_LIMIT
 };
 
 const selectBasicEntry = (analysisResult, events) => {
-  const candidates = expandRecommendations(analysisResult, events);
+  const candidates = expandRecommendations(analysisResult, events)
+    .filter((entry) => !isFallbackEntry(entry));
   const allowedEntry = candidates.find((entry) => entry.odd && entry.odd > 1 && entry.odd <= BASIC_MAX_ODD);
 
   if (allowedEntry) return allowedEntry;
@@ -667,12 +707,68 @@ const enrichEventsWithOdds = async (events = [], limit = 100) => {
   ];
 };
 
-const fetchDailyAnalysis = async () => {
+const analyzeDailyEvents = async (events = []) => {
+  const analyses = [];
+  let index = 0;
+
+  async function worker() {
+    while (index < events.length) {
+      const currentIndex = index;
+      index += 1;
+      const event = events[currentIndex];
+
+      try {
+        const analysisRes = await axios.get(
+          `${PLACARPRO_API_URL}/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
+          { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
+        );
+        const analysis = analysisRes.data?.result;
+        const oddsData = ENABLE_ODDS_ENRICHMENT ? await fetchEventOdds(event.id) : null;
+        const enrichedAnalysis = oddsData ? enrichAnalysisWithOdds(analysis, oddsData) : analysis;
+
+        if (ENABLE_ODDS_ENRICHMENT && !hasRealOddEntry(enrichedAnalysis, [event])) {
+          console.warn(`Analise da IA para o evento ${event.id} veio sem odd real casada.`);
+        }
+
+        analyses[currentIndex] = enrichedAnalysis;
+      } catch (err) {
+        console.warn(`Analise individual falhou para o evento ${event.id}:`, err.message);
+        analyses[currentIndex] = null;
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(DAILY_PICK_ANALYSIS_CONCURRENCY, events.length) }, () => worker())
+  );
+
+  return analyses.filter(Boolean);
+};
+
+const fetchDailyAnalysis = async (mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
   let events = [];
   let eligibleEvents = [];
   const fetchErrors = [];
 
-  for (const offset of [0, 1, 2]) {
+  if (matchMode === 'live') {
+    try {
+      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/live-matches`, { timeout: 60000 });
+      const upstreamStatus = Number(matchesRes.data?.status || matchesRes.status);
+
+      if (upstreamStatus >= 400) {
+        throw new Error(`scraper retornou status ${upstreamStatus}`);
+      }
+
+      events = matchesRes.data.data || [];
+      eligibleEvents = filterLiveEvents(events);
+    } catch (err) {
+      fetchErrors.push(`live: ${err.message}`);
+      console.warn('Nao foi possivel buscar jogos ao vivo para a aposta do dia:', err.message);
+    }
+  }
+
+  for (const offset of matchMode === 'live' ? [] : [0, 1, 2]) {
     const date = getLocalDateKeyOffset(offset);
 
     try {
@@ -698,58 +794,41 @@ const fetchDailyAnalysis = async () => {
       throw new Error(`Nao foi possivel buscar jogos para gerar entradas (${fetchErrors.join(' | ')})`);
     }
 
-    return { selectedEvents: [], analysisResult: null };
+    return { matchMode, selectedEvents: [], analysisResult: null };
   }
 
-  const oddsAwareEvents = await enrichEventsWithOdds(eligibleEvents);
-  const selectedEvents = oddsAwareEvents.slice(0, PREMIUM_ENTRY_LIMIT);
+  const rankedEvents = ENABLE_ODDS_ENRICHMENT
+    ? await enrichEventsWithOdds(eligibleEvents)
+    : eligibleEvents;
+  const selectedEvents = rankedEvents.slice(0, PREMIUM_ENTRY_LIMIT);
 
   try {
-    const analyses = await Promise.all(selectedEvents.map(async (event) => {
-      try {
-        const analysisRes = await axios.get(
-          `${PLACARPRO_API_URL}/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
-          { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
-        );
-        const analysis = analysisRes.data?.result;
-        const oddsData = await fetchEventOdds(event.id);
-        const enrichedAnalysis = enrichAnalysisWithOdds(analysis, oddsData);
-
-        if (!hasRealOddEntry(enrichedAnalysis, [event])) {
-          console.warn(`Analise da IA para o evento ${event.id} veio sem odd real casada.`);
-        }
-
-        return enrichedAnalysis;
-      } catch (err) {
-        console.warn(`Analise individual falhou para o evento ${event.id}:`, err.message);
-        return null;
-      }
-    }));
-    const validAnalyses = analyses.filter(Boolean).sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
-    const fallbackAnalysis = validAnalyses.length ? null : buildFallbackAnalysisFromEvents(selectedEvents);
+    const analyses = await analyzeDailyEvents(selectedEvents);
+    const validAnalyses = analyses.filter(isUsableAnalysis).sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
 
     return {
+      matchMode,
       selectedEvents,
       analysisResult: validAnalyses.length ? {
         ...validAnalyses[0],
         bestEntry: validAnalyses[0].bestEntry || validAnalyses[0],
         analyses: validAnalyses,
-      } : fallbackAnalysis,
+      } : null,
     };
   } catch (err) {
     console.warn('Analise individual dos jogos de hoje falhou:', err.message);
-    return { selectedEvents, analysisResult: buildFallbackAnalysisFromEvents(selectedEvents) };
+    return { matchMode, selectedEvents, analysisResult: null };
   }
 };
 
-const getDailyPickCacheKey = () => {
-  return `daily-pick-v18:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
+const getDailyPickCacheKey = (mode = 'prelive') => {
+  return `daily-pick-v23:${normalizeMatchMode(mode)}:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
 };
 
 const isCacheFresh = (cache) => Boolean(cache?.updatedAt) && Date.now() - cache.updatedAt < DAILY_PICK_CACHE_TTL_MS;
 
-const readPersistedDailyPick = async () => {
-  const cacheKey = getDailyPickCacheKey();
+const readPersistedDailyPick = async (mode = 'prelive') => {
+  const cacheKey = getDailyPickCacheKey(mode);
   const row = await get('SELECT * FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
 
   if (!row) return null;
@@ -767,8 +846,8 @@ const readPersistedDailyPick = async () => {
   }
 };
 
-const persistDailyPick = async (data) => {
-  const cacheKey = getDailyPickCacheKey();
+const persistDailyPick = async (data, mode = 'prelive') => {
+  const cacheKey = getDailyPickCacheKey(mode);
   const payload = JSON.stringify(data);
   const existing = await get('SELECT id FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
 
@@ -778,71 +857,81 @@ const persistDailyPick = async (data) => {
     await run('INSERT INTO ai_analysis_cache (cache_key, payload) VALUES (?, ?)', [cacheKey, payload]);
   }
 
-  dailyPickRuntimeCache = {
+  const runtimeCache = {
     cacheKey,
     data,
     updatedAt: Date.now(),
     error: null,
   };
 
-  return dailyPickRuntimeCache;
+  dailyPickRuntimeCaches.set(normalizeMatchMode(mode || data?.matchMode), runtimeCache);
+
+  return runtimeCache;
 };
 
-const refreshDailyPick = async () => {
-  if (dailyPickRefreshPromise) return dailyPickRefreshPromise;
+const refreshDailyPick = async (mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
+  const currentPromise = dailyPickRefreshPromises.get(matchMode);
+  if (currentPromise) return currentPromise;
 
-  dailyPickRefreshPromise = fetchDailyAnalysis()
-    .then((data) => persistDailyPick(data))
+  const refreshPromise = fetchDailyAnalysis(matchMode)
+    .then((data) => persistDailyPick(data, matchMode))
     .catch((err) => {
-      dailyPickRuntimeCache = {
-        cacheKey: getDailyPickCacheKey(),
-        data: dailyPickRuntimeCache?.data || null,
-        updatedAt: dailyPickRuntimeCache?.updatedAt || 0,
+      const previousCache = dailyPickRuntimeCaches.get(matchMode);
+      const failedCache = {
+        cacheKey: getDailyPickCacheKey(matchMode),
+        data: previousCache?.data || null,
+        updatedAt: previousCache?.updatedAt || 0,
         error: err.message,
       };
+      dailyPickRuntimeCaches.set(matchMode, failedCache);
       console.error('Erro ao atualizar aposta do dia na API PlacarPro:', err.message);
       throw err;
     })
     .finally(() => {
-      dailyPickRefreshPromise = null;
+      dailyPickRefreshPromises.delete(matchMode);
     });
 
-  return dailyPickRefreshPromise;
+  dailyPickRefreshPromises.set(matchMode, refreshPromise);
+  return refreshPromise;
 };
 
 const hasAiAnalysis = (cache) => {
-  const selectedEvents = filterUpcomingEvents(cache?.data?.selectedEvents || []);
+  const selectedEvents = filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode);
   if (!cache?.data?.analysisResult || selectedEvents.length === 0) return false;
   return selectVariedEntries(cache.data.analysisResult, selectedEvents, PREMIUM_ENTRY_LIMIT).length > 0;
 };
 
-const hasDailyPickEvents = (cache) => filterUpcomingEvents(cache?.data?.selectedEvents || []).length > 0;
+const hasDailyPickEvents = (cache) => filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode).length > 0;
 
-const ensureDailyPick = async ({ requireAnalysis = false } = {}) => {
-  const cacheKey = getDailyPickCacheKey();
+const ensureDailyPick = async ({ requireAnalysis = false, mode = 'prelive' } = {}) => {
+  const matchMode = normalizeMatchMode(mode);
+  const cacheKey = getDailyPickCacheKey(matchMode);
 
   if (
-    dailyPickRuntimeCache?.cacheKey === cacheKey
-    && dailyPickRuntimeCache.data
-    && isCacheFresh(dailyPickRuntimeCache)
-    && hasDailyPickEvents(dailyPickRuntimeCache)
-    && (!requireAnalysis || hasAiAnalysis(dailyPickRuntimeCache))
+    dailyPickRuntimeCaches.get(matchMode)?.cacheKey === cacheKey
+    && dailyPickRuntimeCaches.get(matchMode)?.data
+    && isCacheFresh(dailyPickRuntimeCaches.get(matchMode))
+    && hasDailyPickEvents(dailyPickRuntimeCaches.get(matchMode))
+    && (!requireAnalysis || hasAiAnalysis(dailyPickRuntimeCaches.get(matchMode)))
   ) {
-    return dailyPickRuntimeCache;
+    return dailyPickRuntimeCaches.get(matchMode);
   }
 
-  const persisted = await readPersistedDailyPick();
+  const persisted = await readPersistedDailyPick(matchMode);
   if (persisted?.data && isCacheFresh(persisted) && hasDailyPickEvents(persisted) && (!requireAnalysis || hasAiAnalysis(persisted))) {
-    dailyPickRuntimeCache = persisted;
-    return dailyPickRuntimeCache;
+    dailyPickRuntimeCaches.set(matchMode, persisted);
+    return persisted;
   }
 
-  return refreshDailyPick();
+  return refreshDailyPick(matchMode);
 };
 
-const buildDailyPickPayload = (plan, cache = dailyPickRuntimeCache) => {
-  const selectedEvents = filterUpcomingEvents(cache?.data?.selectedEvents || []);
-  const analysisResult = selectedEvents.length ? cache?.data?.analysisResult : null;
+const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode || cache?.data?.matchMode);
+  const activeCache = cache || dailyPickRuntimeCaches.get(matchMode);
+  const selectedEvents = filterEventsForMode(activeCache?.data?.selectedEvents || [], matchMode);
+  const analysisResult = selectedEvents.length ? activeCache?.data?.analysisResult : null;
   let apostaDoDia = null;
   let entradasPremium = [];
 
@@ -856,20 +945,17 @@ const buildDailyPickPayload = (plan, cache = dailyPickRuntimeCache) => {
       apostaDoDia = selectBasicEntry(analysisResult, selectedEvents);
     }
   } else {
-    if (plan === 'premium') {
-      entradasPremium = selectVariedEntries({ analyses: [] }, selectedEvents, PREMIUM_ENTRY_LIMIT);
-      apostaDoDia = entradasPremium[0] || selectBasicEntry({ analyses: [] }, selectedEvents);
-    } else {
-      apostaDoDia = selectBasicEntry({ analyses: [] }, selectedEvents);
-    }
+    apostaDoDia = null;
+    entradasPremium = [];
   }
 
   return {
     aposta_do_dia: apostaDoDia,
     entradas_premium: entradasPremium,
-    aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromise),
-    aposta_do_dia_erro: cache?.error || null,
-    aposta_do_dia_atualizada_em: cache?.updatedAt || null,
+    aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromises.get(matchMode)),
+    aposta_do_dia_erro: activeCache?.error || null,
+    aposta_do_dia_atualizada_em: activeCache?.updatedAt || null,
+    match_mode: matchMode,
   };
 };
 
@@ -954,6 +1040,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
+    const matchMode = normalizeMatchMode(req.query.matchMode);
     const [user, apostas, history] = await Promise.all([
       get('SELECT * FROM users WHERE id = ?', [req.user.id]),
       all('SELECT * FROM bets WHERE user_id = ? ORDER BY id DESC LIMIT 10', [req.user.id]),
@@ -969,10 +1056,10 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const saldo = Number(user.saldo_atual || 0);
     const bancaInicial = Number(user.banca_inicial || 0);
     const lucro = saldo - bancaInicial;
-    const dailyPick = await ensureDailyPick({ requireAnalysis: user.plano === 'premium' }).catch((err) => ({
-      cacheKey: getDailyPickCacheKey(),
-      data: dailyPickRuntimeCache?.data || null,
-      updatedAt: dailyPickRuntimeCache?.updatedAt || 0,
+    const dailyPick = await ensureDailyPick({ requireAnalysis: user.plano === 'premium', mode: matchMode }).catch((err) => ({
+      cacheKey: getDailyPickCacheKey(matchMode),
+      data: dailyPickRuntimeCaches.get(matchMode)?.data || null,
+      updatedAt: dailyPickRuntimeCaches.get(matchMode)?.updatedAt || 0,
       error: err.message,
     }));
 
@@ -984,7 +1071,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       plano: user.plano,
       banca_inicial: bancaInicial,
       stake_sugerida: Math.min(saldo, Math.max(1, saldo * 0.02)),
-      ...buildDailyPickPayload(user.plano, dailyPick),
+      ...buildDailyPickPayload(user.plano, dailyPick, matchMode),
       history: history.map((h) => ({ day: String(h.dia).padStart(2, '0'), value: Number(h.saldo) })),
       apostas_recentes: apostas.map((a) => ({
         id: a.id,
@@ -1007,19 +1094,105 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
 app.get('/api/daily-pick', authenticateToken, async (req, res) => {
   try {
+    const matchMode = normalizeMatchMode(req.query.matchMode);
     const user = await get('SELECT plano FROM users WHERE id = ?', [req.user.id]);
-    const dailyPick = await ensureDailyPick({ requireAnalysis: user?.plano === 'premium' }).catch((err) => ({
-      cacheKey: getDailyPickCacheKey(),
-      data: dailyPickRuntimeCache?.data || null,
-      updatedAt: dailyPickRuntimeCache?.updatedAt || 0,
+    const dailyPick = await ensureDailyPick({ requireAnalysis: user?.plano === 'premium', mode: matchMode }).catch((err) => ({
+      cacheKey: getDailyPickCacheKey(matchMode),
+      data: dailyPickRuntimeCaches.get(matchMode)?.data || null,
+      updatedAt: dailyPickRuntimeCaches.get(matchMode)?.updatedAt || 0,
       error: err.message,
     }));
 
-    res.json(buildDailyPickPayload(user?.plano || 'basico', dailyPick));
+    res.json(buildDailyPickPayload(user?.plano || 'basico', dailyPick, matchMode));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erro ao buscar aposta do dia' });
   }
+});
+
+const analysisQueryParams = (query = {}) => {
+  const params = new URLSearchParams({
+    includeOdds: 'false',
+    useOddsFallback: 'false',
+  });
+  const allowed = [
+    'date',
+    'limit',
+    'maxCandidates',
+    'mode',
+    'daysAhead',
+    'analysisConcurrency',
+    'analysisTimeoutMs',
+    'home',
+    'away',
+    'match',
+  ];
+
+  allowed.forEach((key) => {
+    if (query[key] !== undefined && String(query[key]).trim()) {
+      params.set(key, String(query[key]).trim());
+    }
+  });
+
+  return params;
+};
+
+const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
+  try {
+    const params = analysisQueryParams({ ...req.query, ...extraQuery });
+    const response = await axios.get(`${PLACARPRO_API_URL}${upstreamPath}?${params}`, {
+      timeout: 180000,
+    });
+
+    res.status(response.status).json(response.data);
+  } catch (err) {
+    const status = Number(err.response?.status || 502);
+    const upstreamError = err.response?.data?.error || err.response?.data?.message;
+    console.error(`Erro ao consultar analise ${upstreamPath}:`, upstreamError || err.message);
+    res.status(status >= 400 && status < 600 ? status : 502).json({
+      ok: false,
+      error: upstreamError || 'Nao foi possivel concluir a analise agora.',
+    });
+  }
+};
+
+// Uma partida ou exatamente tres IDs separados por virgula.
+app.get('/api/analysis/events/:eventIds', authenticateToken, async (req, res) => {
+  const eventIds = String(req.params.eventIds || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  if (![1, 3].includes(eventIds.length) || eventIds.some((id) => !/^\d+$/.test(id))) {
+    return res.status(400).json({ error: 'Informe 1 ID ou exatamente 3 IDs numericos do OGOL.' });
+  }
+
+  return proxyAnalysis(req, res, `/analysis/${eventIds.join(',')}`);
+});
+
+app.get('/api/analysis/by-teams', authenticateToken, async (req, res) => {
+  const home = String(req.query.home || '').trim();
+  const away = String(req.query.away || '').trim();
+
+  if (!home || !away) {
+    return res.status(400).json({ error: 'Informe os dois times da partida.' });
+  }
+
+  return proxyAnalysis(req, res, '/analysis/by-teams');
+});
+
+app.get('/api/analysis/daily', authenticateToken, async (req, res) => {
+  return proxyAnalysis(req, res, '/analysis/full-daily');
+});
+
+app.get('/api/analysis/tournament/:tournamentId', authenticateToken, async (req, res) => {
+  const tournamentId = String(req.params.tournamentId || '').trim();
+
+  if (!/^\d+$/.test(tournamentId)) {
+    return res.status(400).json({ error: 'Informe um ID de campeonato valido.' });
+  }
+
+  return proxyAnalysis(req, res, `/analysis/tournament/${tournamentId}`);
 });
 
 app.put('/api/bankroll', authenticateToken, async (req, res) => {
