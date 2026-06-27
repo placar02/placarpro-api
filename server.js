@@ -90,6 +90,25 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+const requirePremium = async (req, res, next) => {
+  try {
+    const user = await get('SELECT plano FROM users WHERE id = ?', [req.user.id]);
+
+    if (!user) return res.sendStatus(404);
+    if (user.plano !== 'premium') {
+      return res.status(403).json({
+        error: 'Esta funcionalidade e exclusiva para usuarios Premium.',
+        code: 'PREMIUM_REQUIRED',
+      });
+    }
+
+    next();
+  } catch (err) {
+    console.error('Erro ao validar plano Premium:', err);
+    res.status(500).json({ error: 'Nao foi possivel validar seu plano.' });
+  }
+};
+
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyPrefix: 'auth' }));
 app.use('/api/payments', rateLimit({ windowMs: 60 * 1000, max: 40, keyPrefix: 'payments' }));
 
@@ -1110,6 +1129,27 @@ app.get('/api/daily-pick', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+    if (!user) return res.sendStatus(404);
+
+    res.json({
+      user: {
+        id: user.id,
+        nome: user.nome,
+        email: user.email,
+        plano: user.plano,
+        saldo: Number(user.saldo_atual || 0),
+        banca_inicial: Number(user.banca_inicial || 0),
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar usuario.' });
+  }
+});
+
 const analysisQueryParams = (query = {}) => {
   const params = new URLSearchParams({
     includeOdds: 'false',
@@ -1157,7 +1197,7 @@ const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
 };
 
 // Uma partida ou exatamente tres IDs separados por virgula.
-app.get('/api/analysis/events/:eventIds', authenticateToken, async (req, res) => {
+app.get('/api/analysis/events/:eventIds', authenticateToken, requirePremium, async (req, res) => {
   const eventIds = String(req.params.eventIds || '')
     .split(',')
     .map((id) => id.trim())
@@ -1170,7 +1210,7 @@ app.get('/api/analysis/events/:eventIds', authenticateToken, async (req, res) =>
   return proxyAnalysis(req, res, `/analysis/${eventIds.join(',')}`);
 });
 
-app.get('/api/analysis/by-teams', authenticateToken, async (req, res) => {
+app.get('/api/analysis/by-teams', authenticateToken, requirePremium, async (req, res) => {
   const home = String(req.query.home || '').trim();
   const away = String(req.query.away || '').trim();
 
@@ -1181,11 +1221,11 @@ app.get('/api/analysis/by-teams', authenticateToken, async (req, res) => {
   return proxyAnalysis(req, res, '/analysis/by-teams');
 });
 
-app.get('/api/analysis/daily', authenticateToken, async (req, res) => {
+app.get('/api/analysis/daily', authenticateToken, requirePremium, async (req, res) => {
   return proxyAnalysis(req, res, '/analysis/full-daily');
 });
 
-app.get('/api/analysis/tournament/:tournamentId', authenticateToken, async (req, res) => {
+app.get('/api/analysis/tournament/:tournamentId', authenticateToken, requirePremium, async (req, res) => {
   const tournamentId = String(req.params.tournamentId || '').trim();
 
   if (!/^\d+$/.test(tournamentId)) {
