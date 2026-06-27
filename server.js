@@ -6,7 +6,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 require('dotenv').config();
 
-const { run, get, all } = require('./db');
+const { ready: databaseReady, run, get, all } = require('./db');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 app.disable('x-powered-by');
@@ -83,18 +84,35 @@ const authenticateToken = (req, res, next) => {
 
   if (!token) return res.sendStatus(401);
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, async (err, user) => {
     if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
+    try {
+      const account = await get('SELECT id, email, role, plano, status FROM users WHERE id = ?', [user.id]);
+      if (!account || account.status === 'blocked') return res.status(403).json({ error: 'Acesso negado.' });
+      if (user.sid) {
+        const session = await get('SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.sid, user.id]);
+        if (!session) return res.status(403).json({ error: 'Sessao expirada ou encerrada.' });
+        await run('UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?', [user.sid]);
+      }
+      req.user = { ...user, role: account.role || (account.plano === 'premium' ? 'premium' : 'free') };
+      return next();
+    } catch (databaseError) {
+      return next(databaseError);
+    }
   });
 };
 
 const requirePremium = async (req, res, next) => {
   try {
     const user = await get('SELECT plano FROM users WHERE id = ?', [req.user.id]);
+    const subscription = await get("SELECT id, ends_at FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [req.user.id]);
 
     if (!user) return res.sendStatus(404);
+    if (subscription?.ends_at && new Date(subscription.ends_at).getTime() <= Date.now()) {
+      await run("UPDATE subscriptions SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [subscription.id]);
+      await run("UPDATE users SET plano = 'basico', role = CASE WHEN role = 'admin' THEN 'admin' ELSE 'free' END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [req.user.id]);
+      return res.status(403).json({ error: 'Sua assinatura expirou.', code: 'SUBSCRIPTION_EXPIRED' });
+    }
     if (user.plano !== 'premium') {
       return res.status(403).json({
         error: 'Esta funcionalidade e exclusiva para usuarios Premium.',
@@ -111,6 +129,27 @@ const requirePremium = async (req, res, next) => {
 
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyPrefix: 'auth' }));
 app.use('/api/payments', rateLimit({ windowMs: 60 * 1000, max: 40, keyPrefix: 'payments' }));
+app.use('/api/admin', adminRoutes);
+
+app.get('/api/settings/public', async (_req, res) => {
+  try {
+    const settings = await get(`SELECT system_name, logo_url, favicon_url, primary_color, secondary_color,
+      contact_email, contact_phone, social_links, home_text, user_message, maintenance_mode
+      FROM app_settings WHERE id = 1`);
+    res.json(settings || {});
+  } catch (_error) {
+    res.json({ system_name: 'PlacarPro', primary_color: '#00E676', secondary_color: '#1A1A1A' });
+  }
+});
+
+app.use(async (req, res, next) => {
+  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/auth') || req.path === '/api/health' || req.path === '/api/settings/public' || req.path === '/api/payments/config' || req.path === '/api/payments/webhook') return next();
+  try {
+    const settings = await get('SELECT maintenance_mode, user_message FROM app_settings WHERE id = 1');
+    if (settings?.maintenance_mode) return res.status(503).json({ error: settings.user_message || 'Sistema temporariamente em manutencao.', code: 'MAINTENANCE_MODE' });
+    return next();
+  } catch (error) { return next(error); }
+});
 
 const asMoney = (value) => Number(value || 0).toFixed(2).replace('.', ',');
 
@@ -639,7 +678,23 @@ const activatePremiumFromPayment = async (payment) => {
   );
 
   if (isPaidStatus(payment.status)) {
-    await run("UPDATE users SET plano = 'premium' WHERE id = ?", [session.user_id]);
+    const [plan, settings] = await Promise.all([
+      session.plan_id ? get('SELECT billing_period FROM plans WHERE id = ?', [session.plan_id]) : null,
+      get('SELECT max_accesses FROM payment_settings WHERE id = 1'),
+    ]);
+    const periodDays = { monthly: 30, quarterly: 90, yearly: 365 }[plan?.billing_period];
+    const endsAt = periodDays ? new Date(Date.now() + periodDays * 86400000) : null;
+    await run("UPDATE users SET plano = 'premium', role = CASE WHEN role = 'admin' THEN 'admin' ELSE 'premium' END, plan_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [session.plan_id, session.user_id]);
+    const activeSubscription = await get("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [session.user_id]);
+    if (!activeSubscription) {
+      await run('INSERT INTO subscriptions (user_id, plan_id, status, ends_at, access_limit) VALUES (?, ?, ?, ?, ?)', [session.user_id, session.plan_id, 'active', endsAt, settings?.max_accesses || 1]);
+    } else {
+      await run('UPDATE subscriptions SET plan_id = ?, ends_at = ?, access_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.plan_id, endsAt, settings?.max_accesses || 1, activeSubscription.id]);
+    }
+    if (session.coupon_id && !session.coupon_redeemed) {
+      const redeemed = await run('UPDATE payment_sessions SET coupon_redeemed = TRUE WHERE id = ? AND coupon_redeemed = FALSE', [session.id]);
+      if (redeemed.changes) await run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.coupon_id]);
+    }
   }
 
   return session;
@@ -982,16 +1037,109 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/payments/config', authenticateToken, (_req, res) => {
+const getCheckoutPlan = async (requestedPlanId) => {
+  const requested = Number(requestedPlanId);
+  const hasRequestedPlan = Number.isInteger(requested) && requested > 0;
+  const plan = hasRequestedPlan
+    ? await get('SELECT * FROM plans WHERE id = ? AND active = TRUE', [requested])
+    : await get("SELECT * FROM plans WHERE active = TRUE ORDER BY CASE WHEN slug = 'premium-mensal' THEN 0 ELSE 1 END, display_order, id LIMIT 1");
+  if (hasRequestedPlan && !plan) {
+    const error = new Error('Plano indisponivel.'); error.statusCode = 404; throw error;
+  }
+  return plan || { id: null, name: 'Premium Mensal', slug: 'premium', price_cents: PREMIUM_PLAN_PRICE };
+};
+
+const getPaymentSettings = async () => await get('SELECT * FROM payment_settings WHERE id = 1') || {
+  trial_days: 0, max_accesses: 1, default_discount_percent: 0, mercado_pago_enabled: true, subscription_status: 'active',
+};
+
+const calculateCheckout = async ({ planId, couponCode }) => {
+  const [plan, settings] = await Promise.all([getCheckoutPlan(planId), getPaymentSettings()]);
+  if (!settings.mercado_pago_enabled) { const error = new Error('Pagamentos temporariamente desativados.'); error.statusCode = 503; throw error; }
+  if (settings.subscription_status !== 'active') { const error = new Error('Novas assinaturas estao temporariamente pausadas.'); error.statusCode = 503; throw error; }
+
+  const originalAmount = Number(plan.price_cents);
+  let discountCents = Math.round(originalAmount * (Number(settings.default_discount_percent || 0) / 100));
+  let coupon = null;
+  const normalizedCode = String(couponCode || '').trim().toUpperCase();
+  if (normalizedCode) {
+    coupon = await get(`SELECT * FROM coupons WHERE UPPER(code) = ? AND active = TRUE
+      AND (valid_from IS NULL OR valid_from <= CURRENT_TIMESTAMP)
+      AND (valid_until IS NULL OR valid_until >= CURRENT_TIMESTAMP)
+      AND (max_uses IS NULL OR uses_count < max_uses)`, [normalizedCode]);
+    if (!coupon) { const error = new Error('Cupom invalido, expirado ou esgotado.'); error.statusCode = 422; throw error; }
+    discountCents = coupon.discount_type === 'fixed'
+      ? Number(coupon.discount_value)
+      : Math.round(originalAmount * (Number(coupon.discount_value) / 100));
+  }
+  discountCents = Math.min(Math.max(0, discountCents), Math.max(0, originalAmount - 100));
+  return { plan, settings, coupon, originalAmount, discountCents, finalAmount: originalAmount - discountCents };
+};
+
+app.get('/api/payments/config', authenticateToken, async (req, res) => {
   const testMode = isMercadoPagoTestMode();
+  const [plan, plans, settings] = await Promise.all([
+    getCheckoutPlan(req.query.planId),
+    all('SELECT id, name, slug, price_cents, description, benefits, color, badge, billing_period FROM plans WHERE active = TRUE ORDER BY display_order, id'),
+    getPaymentSettings(),
+  ]);
+  const defaultDiscount = Number(settings.default_discount_percent || 0);
+  const publicPlans = plans.map((item) => ({
+    ...item,
+    checkout_price_cents: Math.max(100, Number(item.price_cents) - Math.round(Number(item.price_cents) * defaultDiscount / 100)),
+  }));
+  const selectedPublicPlan = publicPlans.find((item) => Number(item.id) === Number(plan.id));
 
   res.json({
     publicKey: process.env.MERCADOPAGO_PUBLIC_KEY || '',
-    amount: PREMIUM_PLAN_PRICE_BRL,
+    amount: Number((Number(selectedPublicPlan?.checkout_price_cents || plan.price_cents) / 100).toFixed(2)),
+    plan: { id: plan.id, name: plan.name, slug: plan.slug },
+    plans: publicPlans,
+    paymentSettings: {
+      trialDays: settings.trial_days,
+      maxAccesses: settings.max_accesses,
+      defaultDiscountPercent: Number(settings.default_discount_percent || 0),
+      mercadoPagoEnabled: settings.mercado_pago_enabled,
+      subscriptionStatus: settings.subscription_status,
+    },
     testMode,
     testBuyerEmail: testMode ? (String(process.env.MERCADOPAGO_TEST_BUYER_EMAIL || '').trim() || null) : null,
     allowTestApproval: process.env.ALLOW_PAYMENT_TEST_APPROVAL === 'true',
   });
+});
+
+app.post('/api/payments/coupon/validate', authenticateToken, async (req, res) => {
+  try {
+    const pricing = await calculateCheckout({ planId: req.body?.planId, couponCode: req.body?.couponCode });
+    res.json({
+      valid: true,
+      coupon: pricing.coupon ? { code: pricing.coupon.code, discountType: pricing.coupon.discount_type, discountValue: pricing.coupon.discount_value } : null,
+      originalAmount: Number((pricing.originalAmount / 100).toFixed(2)),
+      discount: Number((pricing.discountCents / 100).toFixed(2)),
+      amount: Number((pricing.finalAmount / 100).toFixed(2)),
+    });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ error: error.message });
+  }
+});
+
+app.post('/api/payments/trial', authenticateToken, async (req, res) => {
+  try {
+    const [settings, previous] = await Promise.all([
+      getPaymentSettings(),
+      get('SELECT id FROM subscriptions WHERE user_id = ? LIMIT 1', [req.user.id]),
+    ]);
+    if (settings.subscription_status !== 'active' || Number(settings.trial_days) <= 0) return res.status(403).json({ error: 'Periodo de teste indisponivel.' });
+    if (previous) return res.status(409).json({ error: 'O periodo de teste ja foi utilizado.' });
+    const plan = await getCheckoutPlan(req.body?.planId);
+    await run(`INSERT INTO subscriptions (user_id, plan_id, status, trial_ends_at, ends_at, access_limit)
+      VALUES (?, ?, 'active', CURRENT_TIMESTAMP + (? * interval '1 day'), CURRENT_TIMESTAMP + (? * interval '1 day'), ?)`,
+      [req.user.id, plan.id, settings.trial_days, settings.trial_days, settings.max_accesses]);
+    await run("UPDATE users SET plano = 'premium', role = CASE WHEN role = 'admin' THEN 'admin' ELSE 'premium' END, plan_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [plan.id, req.user.id]);
+    res.json({ premium: true, trialDays: settings.trial_days });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -1017,8 +1165,10 @@ app.post('/api/auth/register', async (req, res) => {
       [nome, email, hashedPassword]
     );
 
-    const token = jwt.sign({ id: result.id, email }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: result.id, nome, email, plano: 'basico', saldo: 0, banca_inicial: 0 } });
+    const sessionId = crypto.randomUUID();
+    await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, result.id]);
+    const token = jwt.sign({ id: result.id, email, role: 'free', sid: sessionId }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, user: { id: result.id, nome, email, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erro interno do servidor' });
@@ -1039,7 +1189,22 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Usuario ou senha incorretos' });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+    if (user.status === 'blocked') {
+      return res.status(403).json({ error: 'Usuario bloqueado. Entre em contato com o suporte.' });
+    }
+
+    await run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ? AND expires_at <= CURRENT_TIMESTAMP', [user.id]);
+    const accessSettings = await get('SELECT max_accesses FROM payment_settings WHERE id = 1');
+    const activeSessions = await get('SELECT COUNT(*)::int total FROM user_sessions WHERE user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.id]);
+    if (Number(activeSessions?.total || 0) >= Number(accessSettings?.max_accesses || 1)) {
+      return res.status(403).json({ error: `Limite de ${accessSettings?.max_accesses || 1} acesso(s) simultaneo(s) atingido.` });
+    }
+
+    await run('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
+    const userRole = user.role || (user.plano === 'premium' ? 'premium' : 'free');
+    const sessionId = crypto.randomUUID();
+    await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, user.id]);
+    const token = jwt.sign({ id: user.id, email: user.email, role: userRole, sid: sessionId }, JWT_SECRET, { expiresIn: '24h' });
     res.json({
       token,
       user: {
@@ -1047,6 +1212,8 @@ app.post('/api/auth/login', async (req, res) => {
         nome: user.nome,
         email: user.email,
         plano: user.plano,
+        role: userRole,
+        status: user.status || 'active',
         saldo: Number(user.saldo_atual || 0),
         banca_inicial: Number(user.banca_inicial || 0),
       },
@@ -1129,10 +1296,16 @@ app.get('/api/daily-pick', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  if (req.user.sid) await run('UPDATE user_sessions SET revoked = TRUE WHERE id = ? AND user_id = ?', [req.user.sid, req.user.id]);
+  res.json({ success: true });
+});
+
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const user = await get('SELECT * FROM users WHERE id = ?', [req.user.id]);
     if (!user) return res.sendStatus(404);
+    if (user.status === 'blocked') return res.status(403).json({ error: 'Usuario bloqueado.' });
 
     res.json({
       user: {
@@ -1140,6 +1313,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
         nome: user.nome,
         email: user.email,
         plano: user.plano,
+        role: user.role || (user.plano === 'premium' ? 'premium' : 'free'),
+        status: user.status || 'active',
         saldo: Number(user.saldo_atual || 0),
         banca_inicial: Number(user.banca_inicial || 0),
       },
@@ -1429,12 +1604,15 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Configure MERCADOPAGO_ACCESS_TOKEN no backend para gerar checkout real.' });
     }
 
-    const externalId = `premium-${req.user.id}-${Date.now()}`;
+    const pricing = await calculateCheckout({ planId: req.body?.planId, couponCode: req.body?.couponCode });
+    const { plan, coupon, originalAmount, discountCents, finalAmount } = pricing;
+    const planPriceBrl = Number((finalAmount / 100).toFixed(2));
+    const externalId = `${plan.slug || 'premium'}-${req.user.id}-${Date.now()}`;
     const notificationUrl = getPaymentNotificationUrl();
     const user = await get('SELECT email, nome FROM users WHERE id = ?', [req.user.id]);
     const paymentPayload = {
-      transaction_amount: PREMIUM_PLAN_PRICE_BRL,
-      description: process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
+      transaction_amount: planPriceBrl,
+      description: plan.name || process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
       payment_method_id: 'pix',
       external_reference: externalId,
       payer: {
@@ -1443,7 +1621,7 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       },
       metadata: {
         userId: String(req.user.id),
-        plan: 'premium',
+        plan: plan.slug || 'premium',
         external_id: externalId,
       },
     };
@@ -1462,8 +1640,8 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
     const transactionData = payment?.point_of_interaction?.transaction_data || {};
 
     await run(
-      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, payment.id, externalId, payment.status || 'pending', 'premium', PREMIUM_PLAN_PRICE, transactionData.ticket_url, JSON.stringify(payment)]
+      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, transactionData.ticket_url, JSON.stringify(payment)]
     );
 
     res.json({
@@ -1472,6 +1650,7 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       checkoutId: payment.id,
       externalId,
       status: payment.status,
+      pricing: { originalAmount: originalAmount / 100, discount: discountCents / 100, amount: finalAmount / 100 },
       checkoutUrl: transactionData.ticket_url,
       pix: {
         qrCode: transactionData.qr_code,
@@ -1483,7 +1662,7 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
   } catch (err) {
     const details = getMercadoPagoErrorMessage(err);
     console.error('Erro no Mercado Pago:', err.response?.data || err.message);
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       error: `Erro ao processar pagamento com Mercado Pago: ${details}`,
       details,
     });
@@ -1508,7 +1687,10 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Configure MERCADOPAGO_ACCESS_TOKEN no backend para gerar checkout real.' });
     }
 
-    const externalId = `premium-card-${req.user.id}-${Date.now()}`;
+    const pricing = await calculateCheckout({ planId: req.body?.planId, couponCode: req.body?.couponCode });
+    const { plan, coupon, originalAmount, discountCents, finalAmount } = pricing;
+    const planPriceBrl = Number((finalAmount / 100).toFixed(2));
+    const externalId = `${plan.slug || 'premium'}-card-${req.user.id}-${Date.now()}`;
     const notificationUrl = getPaymentNotificationUrl();
     const user = await get('SELECT email, nome FROM users WHERE id = ?', [req.user.id]);
     const payer = {
@@ -1523,8 +1705,8 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     }
 
     const paymentPayload = {
-      transaction_amount: PREMIUM_PLAN_PRICE_BRL,
-      description: process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
+      transaction_amount: planPriceBrl,
+      description: plan.name || process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
       token,
       installments,
       payment_method_id: paymentMethodId,
@@ -1532,7 +1714,7 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       payer,
       metadata: {
         userId: String(req.user.id),
-        plan: 'premium',
+        plan: plan.slug || 'premium',
         external_id: externalId,
       },
     };
@@ -1553,8 +1735,8 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     );
 
     await run(
-      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, payment.id, externalId, payment.status || 'pending', 'premium', PREMIUM_PLAN_PRICE, null, JSON.stringify(payment)]
+      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, null, JSON.stringify(payment)]
     );
 
     await activatePremiumFromPayment(payment);
@@ -1566,6 +1748,7 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       status: payment.status,
       statusDetail: payment.status_detail,
       premium: isPaidStatus(payment.status),
+      pricing: { originalAmount: originalAmount / 100, discount: discountCents / 100, amount: finalAmount / 100 },
     });
   } catch (err) {
     const details = getMercadoPagoErrorMessage(err);
@@ -1575,7 +1758,7 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       requestId: err.response?.headers?.['x-request-id'] || err.response?.headers?.['x-correlation-id'],
       status: err.response?.status,
     });
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       error: `Erro ao processar cartao com Mercado Pago: ${details}`,
       details,
       mercadoPago: mpDetails,
@@ -1698,16 +1881,19 @@ app.post('/api/payments/webhook', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Porta ${PORT} ja esta em uso. Feche a API antiga ou rode: npm run start:local`);
-    process.exit(1);
-  }
-
-  console.error('Erro ao iniciar servidor:', err.message);
+databaseReady.then(() => {
+  const server = app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+  });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Porta ${PORT} ja esta em uso. Feche a API antiga ou rode: npm run start:local`);
+      process.exit(1);
+    }
+    console.error('Erro ao iniciar servidor:', err.message);
+    process.exitCode = 1;
+  });
+}).catch((err) => {
+  console.error('API nao iniciada porque o PostgreSQL falhou:', err.message);
   process.exitCode = 1;
 });

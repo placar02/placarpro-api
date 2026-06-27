@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
+const { runMigrations } = require('./database/migrate');
 
 dotenv.config();
 
@@ -86,13 +87,16 @@ async function initDb() {
       )
     `);
 
+    await runMigrations(pool);
+
     console.log('Tabelas inicializadas (PostgreSQL).');
   } catch (err) {
     console.error('Erro ao inicializar o banco:', err);
+    throw err;
   }
 }
 
-initDb();
+const ready = initDb();
 
 const convertSql = (sql) => {
   let i = 1;
@@ -125,4 +129,4 @@ const all = async (sql, params = []) => {
   return res.rows;
 };
 
-module.exports = { pool, run, get, all };
+module.exports = { pool, ready, run, get, all };
