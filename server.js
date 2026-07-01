@@ -1338,9 +1338,17 @@ const analysisQueryParams = (query = {}) => {
     'daysAhead',
     'analysisConcurrency',
     'analysisTimeoutMs',
+    'analysisRetries',
+    'analysisCacheTtlMs',
+    'fullDailyCacheTtlMs',
+    'profileTimeoutMs',
+    'profileBudgetMs',
     'home',
     'away',
     'match',
+    'strictMarkets',
+    'strictFull',
+    'includeEnrichment',
   ];
 
   allowed.forEach((key) => {
@@ -1356,7 +1364,7 @@ const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
   try {
     const params = analysisQueryParams({ ...req.query, ...extraQuery });
     const response = await axios.get(`${PLACARPRO_API_URL}${upstreamPath}?${params}`, {
-      timeout: 180000,
+      timeout: Number(process.env.ANALYSIS_PROXY_TIMEOUT_MS || 360000),
     });
 
     res.status(response.status).json(response.data);
