@@ -1345,10 +1345,12 @@ const analysisQueryParams = (query = {}) => {
     'profileBudgetMs',
     'home',
     'away',
+    'name',
     'match',
     'strictMarkets',
     'strictFull',
     'includeEnrichment',
+    'wait',
   ];
 
   allowed.forEach((key) => {
@@ -1406,6 +1408,20 @@ app.get('/api/analysis/by-teams', authenticateToken, requirePremium, async (req,
 
 app.get('/api/analysis/daily', authenticateToken, requirePremium, async (req, res) => {
   return proxyAnalysis(req, res, '/analysis/full-daily');
+});
+
+app.get('/api/analysis/jobs/:jobId', authenticateToken, requirePremium, async (req, res) => {
+  const jobId = String(req.params.jobId || '').trim();
+  if (!/^[a-f0-9-]{36}$/i.test(jobId)) {
+    return res.status(400).json({ error: 'Job de analise invalido.' });
+  }
+  return proxyAnalysis(req, res, `/analysis/jobs/${jobId}`);
+});
+
+app.get('/api/analysis/tournament', authenticateToken, requirePremium, async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (name.length < 2) return res.status(400).json({ error: 'Informe o nome do campeonato.' });
+  return proxyAnalysis(req, res, '/analysis/tournament');
 });
 
 app.get('/api/analysis/tournament/:tournamentId', authenticateToken, requirePremium, async (req, res) => {
