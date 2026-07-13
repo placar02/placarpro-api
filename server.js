@@ -18,11 +18,14 @@ const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL ;
 const MERCADOPAGO_API_URL = 'https://api.mercadopago.com';
 const BASIC_MAX_ODD = 1.5;
 const PREMIUM_ENTRY_LIMIT = 5;
-const PREMIUM_PLAN_PRICE = Number(process.env.PREMIUM_PLAN_PRICE_CENTS || 4990);
+const PREMIUM_PLAN_PRICE = Number(process.env.PREMIUM_PLAN_PRICE_CENTS || 2000);
 const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
 const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
 const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
+const DAILY_PICK_FAST_TIMEOUT_MS = Number(process.env.DAILY_PICK_FAST_TIMEOUT_MS || 20000);
+const SCRAPER_RETRY_ATTEMPTS = Math.max(1, Number(process.env.SCRAPER_RETRY_ATTEMPTS || 3));
+const SCRAPER_RETRY_DELAY_MS = Math.max(250, Number(process.env.SCRAPER_RETRY_DELAY_MS || 2500));
 const DAILY_PICK_CACHE_VERSION = process.env.DAILY_PICK_CACHE_VERSION || 'v24';
 const DAILY_PICK_GENERATION_STALE_MS = Number(process.env.DAILY_PICK_GENERATION_STALE_MS || 45 * 60 * 1000);
 const DAILY_PICK_SCHEDULER_ENABLED = process.env.DAILY_PICK_SCHEDULER_ENABLED !== 'false';
@@ -195,6 +198,24 @@ const normalizeOddText = (value) => String(value || '')
   .replace(/\bempate anula\b/g, 'draw no bet')
   .replace(/[^a-z0-9.]+/g, ' ')
   .trim();
+
+const sanitizeProviderText = (value, fallback = '') => {
+  const sanitized = String(value || '')
+    .replace(/\bogol\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return sanitized || fallback;
+};
+
+const getTeamImageUrl = (team) => {
+  const value = team?.imageUrl || team?.imageSmall || team?.image || null;
+  if (!value) return null;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (String(value).startsWith('/') && PLACARPRO_API_URL) {
+    return `${String(PLACARPRO_API_URL).replace(/\/$/, '')}${value}`;
+  }
+  return value;
+};
 
 const flattenOddsChoices = (oddsData) => {
   const groups = Object.values(oddsData?.markets_by_group || {});
@@ -443,9 +464,11 @@ const normalizeEntry = (entry, events = []) => {
       warningSigns: Array.isArray(entry.warningSigns) ? entry.warningSigns : [],
       riskLevel: entry.riskLevel || null,
     },
-    homeTeamName: matchedEvent?.homeTeam?.name || entry.homeTeamName || 'Casa',
-    awayTeamName: matchedEvent?.awayTeam?.name || entry.awayTeamName || 'Fora',
-    tournamentName: matchedEvent?.tournament?.name || entry.tournamentName || 'Desconhecido',
+    homeTeamName: sanitizeProviderText(matchedEvent?.homeTeam?.name || entry.homeTeamName, 'Casa'),
+    awayTeamName: sanitizeProviderText(matchedEvent?.awayTeam?.name || entry.awayTeamName, 'Fora'),
+    homeTeamImageUrl: getTeamImageUrl(matchedEvent?.homeTeam) || entry.homeTeamImageUrl || entry.homeTeam?.imageUrl || null,
+    awayTeamImageUrl: getTeamImageUrl(matchedEvent?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
+    tournamentName: sanitizeProviderText(matchedEvent?.tournament?.name || entry.tournamentName, ''),
     startTimestamp: matchedEvent?.startTimestamp || entry.startTimestamp || null,
     status: matchedEvent?.status || entry.status || null,
     liveMinute,
@@ -533,6 +556,52 @@ const selectBasicEntry = (analysisResult, events) => {
   if (allowedEntry) return allowedEntry;
 
   return candidates[0] || null;
+};
+
+const buildBasicEntryFromEvent = (event) => {
+  if (!event?.id) return null;
+  const homeTeamName = sanitizeProviderText(event.homeTeam?.name, 'Casa');
+  const awayTeamName = sanitizeProviderText(event.awayTeam?.name, 'Fora');
+  const tournamentName = sanitizeProviderText(event.tournament?.name, '');
+  const timestamp = getEventStartTimestamp(event);
+  const matchTime = timestamp
+    ? new Intl.DateTimeFormat('pt-BR', {
+      timeZone: process.env.DAILY_PICK_TIMEZONE || 'America/Sao_Paulo',
+      weekday: 'short',
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(timestamp * 1000))
+    : 'horario a confirmar';
+  const isLive = isLiveStatus(event);
+  const statusText = isLive ? 'ao vivo' : `marcada para ${matchTime}`;
+  const competitionText = tournamentName ? ` pelo ${tournamentName}` : '';
+  const summary = `${homeTeamName} e ${awayTeamName} se enfrentam${competitionText}, em partida ${statusText}. O plano basico mostra a previa do confronto; a leitura completa com IA, mercados e odds reais fica disponivel no Premium.`;
+
+  return normalizeEntry({
+    eventId: event.id,
+    market: 'Previa',
+    recommendation: 'Previa da partida',
+    confidence: 0,
+    rationale: summary,
+    analysisSummary: summary,
+    homeTeamName,
+    awayTeamName,
+    homeTeamImageUrl: getTeamImageUrl(event.homeTeam),
+    awayTeamImageUrl: getTeamImageUrl(event.awayTeam),
+    tournamentName,
+    startTimestamp: timestamp || null,
+    status: event.status || null,
+    keyFactors: [
+      tournamentName ? `Competicao: ${tournamentName}` : null,
+      `Horario: ${matchTime}`,
+      'Analise completa reservada ao plano Premium.',
+    ].filter(Boolean),
+    dataSupport: ['Jogo localizado na agenda esportiva do dia.', 'Confronto e horario confirmados pelo calendario.'],
+    warningSigns: ['Sem recomendacao de entrada no plano basico.', 'Odds reais e leitura da IA nao sao exibidas nesta previa.'],
+    riskAnalysis: 'Use esta previa apenas para acompanhar o jogo. Para decidir entradas, consulte a analise completa com IA e odds reais no Premium.',
+  }, [event]);
 };
 
 const buildFallbackAnalysisFromEvents = (events = []) => {
@@ -751,9 +820,42 @@ const getMercadoPagoPayerEmail = (preferredEmail, fallbackEmail) => {
   return preferredEmail || fallbackEmail;
 };
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isRetryableScraperError = (err) => [429, 502, 503, 504].includes(Number(err.response?.status));
+
+const getPublicDailyPickError = (error) => {
+  const text = String(error || '');
+  if (!text) return null;
+  if (/status code (429|502|503|504)|request failed|timeout|econnreset|enotfound/i.test(text)) {
+    return 'Agenda temporariamente indisponivel. Estamos tentando reconectar ao servico de jogos.';
+  }
+  return text;
+};
+
+const scraperGet = async (path, options = {}) => {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= SCRAPER_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await axios.get(`${PLACARPRO_API_URL}${path}`, options);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableScraperError(err) || attempt >= SCRAPER_RETRY_ATTEMPTS) break;
+
+      console.warn(
+        `Scraper respondeu ${err.response?.status} em ${path}. Tentando novamente (${attempt + 1}/${SCRAPER_RETRY_ATTEMPTS})...`
+      );
+      await wait(SCRAPER_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError;
+};
+
 const fetchEventOdds = async (eventId) => {
   try {
-    const oddsRes = await axios.get(`${PLACARPRO_API_URL}/odds/${eventId}`, { timeout: 15000 });
+    const oddsRes = await scraperGet(`/odds/${eventId}`, { timeout: 15000 });
     return oddsRes.data?.data || null;
   } catch (err) {
     console.warn(`Nao foi possivel buscar odds para o evento ${eventId}:`, err.message);
@@ -801,8 +903,8 @@ const analyzeDailyEvents = async (events = []) => {
       const event = events[currentIndex];
 
       try {
-        const analysisRes = await axios.get(
-          `${PLACARPRO_API_URL}/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
+        const analysisRes = await scraperGet(
+          `/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
           { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
         );
         const analysis = analysisRes.data?.result;
@@ -828,7 +930,7 @@ const analyzeDailyEvents = async (events = []) => {
   return analyses.filter(Boolean);
 };
 
-const fetchDailyAnalysis = async (mode = 'prelive') => {
+const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) => {
   const matchMode = normalizeMatchMode(mode);
   let events = [];
   let eligibleEvents = [];
@@ -836,7 +938,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
 
   if (matchMode === 'live') {
     try {
-      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/live-matches`, { timeout: 60000 });
+      const matchesRes = await scraperGet('/live-matches', { timeout: timeoutMs });
       const upstreamStatus = Number(matchesRes.data?.status || matchesRes.status);
 
       if (upstreamStatus >= 400) {
@@ -848,6 +950,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     } catch (err) {
       fetchErrors.push(`live: ${err.message}`);
       console.warn('Nao foi possivel buscar jogos ao vivo para a aposta do dia:', err.message);
+      if (isRetryableScraperError(err)) throw err;
     }
   }
 
@@ -855,7 +958,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     const date = getLocalDateKeyOffset(offset);
 
     try {
-      const matchesRes = await axios.get(`${PLACARPRO_API_URL}/scheduled-matches?date=${date}`, { timeout: 60000 }); ///////////
+      const matchesRes = await scraperGet(`/scheduled-matches?date=${date}`, { timeout: timeoutMs }); ///////////
       const upstreamStatus = Number(matchesRes.data?.status || matchesRes.status);
 
       if (upstreamStatus >= 400) {
@@ -869,6 +972,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     } catch (err) {
       fetchErrors.push(`${date}: ${err.message}`);
       console.warn(`Nao foi possivel buscar jogos de ${date} para a aposta do dia:`, err.message);
+      if (isRetryableScraperError(err)) throw err;
     }
   }
 
@@ -877,6 +981,46 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
       throw new Error(`Nao foi possivel buscar jogos para gerar entradas (${fetchErrors.join(' | ')})`);
     }
 
+    return { matchMode, eligibleEvents: [] };
+  }
+
+  return { matchMode, eligibleEvents };
+};
+
+const fetchDailyEventsOnly = async (mode = 'prelive') => {
+  const { matchMode, eligibleEvents } = await fetchDailyCandidateEvents(mode, DAILY_PICK_FAST_TIMEOUT_MS);
+  return {
+    matchMode,
+    selectedEvents: eligibleEvents.slice(0, PREMIUM_ENTRY_LIMIT),
+    analysisResult: null,
+  };
+};
+
+const getFastDailyPick = async (mode = 'prelive', state = null) => {
+  const matchMode = normalizeMatchMode(mode);
+  const cacheKey = getDailyPickCacheKey(matchMode);
+  const cached = dailyPickRuntimeCaches.get(matchMode);
+
+  if (cached?.cacheKey === cacheKey && cached?.data && hasDailyPickEvents(cached)) {
+    return cached;
+  }
+
+  const data = await fetchDailyEventsOnly(matchMode);
+  const fastCache = {
+    cacheKey,
+    data,
+    updatedAt: Date.now(),
+    error: state?.status === 'failed' ? state.error : null,
+    status: state?.status || 'generating',
+  };
+  dailyPickRuntimeCaches.set(matchMode, fastCache);
+  return fastCache;
+};
+
+const fetchDailyAnalysis = async (mode = 'prelive') => {
+  const { matchMode, eligibleEvents } = await fetchDailyCandidateEvents(mode);
+
+  if (eligibleEvents.length === 0) {
     return { matchMode, selectedEvents: [], analysisResult: null };
   }
 
@@ -1112,6 +1256,20 @@ const ensureDailyPick = async ({ requireAnalysis = false, mode = 'prelive' } = {
 
   const state = await readDailyPickPublicationState(matchMode);
 
+  if (!requireAnalysis) {
+    if (!state || DAILY_PICK_ON_DEMAND_ENABLED || state.status === 'failed') {
+      publishDailyPickIfNeeded(matchMode).catch(() => null);
+    }
+
+    return getFastDailyPick(matchMode, state).catch((err) => ({
+      cacheKey,
+      data: null,
+      updatedAt: Date.now(),
+      error: getPublicDailyPickError(err.message),
+      status: state?.status || 'pending',
+    }));
+  }
+
   if (!state || DAILY_PICK_ON_DEMAND_ENABLED || state.status === 'failed') {
     const generated = await publishDailyPickIfNeeded(matchMode).catch((err) => ({
       cacheKey,
@@ -1162,7 +1320,7 @@ const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
       apostaDoDia = selectBasicEntry(analysisResult, selectedEvents);
     }
   } else {
-    apostaDoDia = null;
+    apostaDoDia = plan === 'premium' ? null : buildBasicEntryFromEvent(selectedEvents[0]);
     entradasPremium = [];
   }
 
@@ -1170,7 +1328,7 @@ const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
     aposta_do_dia: apostaDoDia,
     entradas_premium: entradasPremium,
     aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromises.get(matchMode)) || activeCache?.status === 'generating' || activeCache?.status === 'pending',
-    aposta_do_dia_erro: activeCache?.error || null,
+    aposta_do_dia_erro: getPublicDailyPickError(activeCache?.error),
     aposta_do_dia_atualizada_em: activeCache?.updatedAt || null,
     match_mode: matchMode,
   };

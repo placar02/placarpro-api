@@ -24,7 +24,7 @@ test('validadores rejeitam payloads perigosos ou incompletos', () => {
 });
 
 test('validadores aceitam CRUDs administrativos válidos', () => {
-  assert.deepEqual(validate('plan', { name: 'Premium', price_cents: 4990, benefits: [], color: '#00E676' }), []);
+  assert.deepEqual(validate('plan', { name: 'Premium Mensal', price_cents: 2000, benefits: [], color: '#00E676' }), []);
   assert.deepEqual(validate('entry', { league: 'Série A', market: 'Mais de 2.5 gols', odd: 1.75, confidence: 80 }), []);
   assert.deepEqual(validate('news', { title: 'Rodada aberta', content: 'Conteúdo da notícia' }), []);
 });

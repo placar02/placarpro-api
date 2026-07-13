@@ -29,10 +29,7 @@ CREATE TABLE IF NOT EXISTS plans (
 
 INSERT INTO plans (name, slug, price_cents, description, benefits, color, badge, display_order, billing_period)
 VALUES
-  ('Premium Mensal', 'premium-mensal', 4990, 'Acesso premium por um mês', '["Análises completas", "Entradas premium"]', '#00E676', 'Mais popular', 1, 'monthly'),
-  ('Premium Trimestral', 'premium-trimestral', 13470, 'Acesso premium por três meses', '["Análises completas", "Economia trimestral"]', '#16A34A', NULL, 2, 'quarterly'),
-  ('Premium Anual', 'premium-anual', 47880, 'Acesso premium por doze meses', '["Análises completas", "Melhor custo anual"]', '#0F766E', 'Melhor valor', 3, 'yearly'),
-  ('Plano Vitalício', 'plano-vitalicio', 149900, 'Acesso premium sem renovação', '["Acesso vitalício", "Todos os recursos premium"]', '#7C3AED', 'Exclusivo', 4, 'lifetime')
+  ('Premium Mensal', 'premium-mensal', 2000, 'Acesso premium mensal ao PlacarPro', '["Análises completas", "Entradas premium", "Explicações da IA"]', '#00E676', 'Mensal', 1, 'monthly')
 ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES plans(id) ON DELETE SET NULL;
