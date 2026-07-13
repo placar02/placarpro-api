@@ -23,7 +23,16 @@ const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
 const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
 const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
-const DAILY_PICK_CACHE_TTL_MS = Number(process.env.DAILY_PICK_CACHE_TTL_MS || 15 * 60 * 1000);
+const DAILY_PICK_CACHE_VERSION = process.env.DAILY_PICK_CACHE_VERSION || 'v24';
+const DAILY_PICK_GENERATION_STALE_MS = Number(process.env.DAILY_PICK_GENERATION_STALE_MS || 45 * 60 * 1000);
+const DAILY_PICK_SCHEDULER_ENABLED = process.env.DAILY_PICK_SCHEDULER_ENABLED !== 'false';
+const DAILY_PICK_ON_DEMAND_ENABLED = process.env.DAILY_PICK_ON_DEMAND_ENABLED === 'true';
+const DAILY_PICK_SCHEDULER_INTERVAL_MS = Number(process.env.DAILY_PICK_SCHEDULER_INTERVAL_MS || 10 * 60 * 1000);
+const DAILY_PICK_SCHEDULER_START_DELAY_MS = Number(process.env.DAILY_PICK_SCHEDULER_START_DELAY_MS || 1000);
+const DAILY_PICK_SCHEDULER_MODES = (process.env.DAILY_PICK_SCHEDULER_MODES || 'prelive')
+  .split(',')
+  .map((mode) => String(mode || '').toLowerCase() === 'live' ? 'live' : 'prelive')
+  .filter((mode, index, modes) => modes.indexOf(mode) === index);
 const ENABLE_ODDS_ENRICHMENT = process.env.ENABLE_ODDS_ENRICHMENT === 'true';
 
 const dailyPickRefreshPromises = new Map();
@@ -896,31 +905,61 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
 };
 
 const getDailyPickCacheKey = (mode = 'prelive') => {
-  return `daily-pick-v23:${normalizeMatchMode(mode)}:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
+  return `daily-pick-${DAILY_PICK_CACHE_VERSION}:${normalizeMatchMode(mode)}:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
 };
 
-const isCacheFresh = (cache) => Boolean(cache?.updatedAt) && Date.now() - cache.updatedAt < DAILY_PICK_CACHE_TTL_MS;
+const getDailyPickProvider = () => process.env.SCORES_PROVIDER || '365scores';
 
-const readPersistedDailyPick = async (mode = 'prelive') => {
-  const cacheKey = getDailyPickCacheKey(mode);
-  const row = await get('SELECT * FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
+const parseDailyPickPayload = (payload) => {
+  if (!payload) return null;
+  if (typeof payload === 'string') return JSON.parse(payload);
+  return payload;
+};
 
+const mapDailyPickPublication = (row, mode = 'prelive') => {
   if (!row) return null;
+  const matchMode = normalizeMatchMode(row.match_mode || mode);
+  return {
+    cacheKey: getDailyPickCacheKey(matchMode),
+    data: parseDailyPickPayload(row.payload),
+    updatedAt: row.generated_at
+      ? new Date(row.generated_at).getTime()
+      : row.updated_at
+        ? new Date(row.updated_at).getTime()
+        : Date.now(),
+    error: row.error || null,
+    status: row.status || 'published',
+  };
+};
+
+const readPublishedDailyPick = async (mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
+  const row = await get(
+    `SELECT * FROM daily_analysis_publications
+     WHERE analysis_date = ? AND match_mode = ? AND provider = ? AND cache_version = ? AND status = 'published'
+     LIMIT 1`,
+    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION]
+  );
 
   try {
-    return {
-      cacheKey,
-      data: JSON.parse(row.payload),
-      updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
-      error: null,
-    };
+    return mapDailyPickPublication(row, matchMode);
   } catch (err) {
-    console.warn('Cache de analise invalido no banco:', err.message);
+    console.warn('Publicacao diaria de analise invalida no banco:', err.message);
     return null;
   }
 };
 
-const persistDailyPick = async (data, mode = 'prelive') => {
+const readDailyPickPublicationState = async (mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
+  return get(
+    `SELECT id, status, error, updated_at, generated_at FROM daily_analysis_publications
+     WHERE analysis_date = ? AND match_mode = ? AND provider = ? AND cache_version = ?
+     LIMIT 1`,
+    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION]
+  );
+};
+
+const persistLegacyDailyPickCache = async (data, mode = 'prelive') => {
   const cacheKey = getDailyPickCacheKey(mode);
   const payload = JSON.stringify(data);
   const existing = await get('SELECT id FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
@@ -930,26 +969,99 @@ const persistDailyPick = async (data, mode = 'prelive') => {
   } else {
     await run('INSERT INTO ai_analysis_cache (cache_key, payload) VALUES (?, ?)', [cacheKey, payload]);
   }
+};
 
+const claimDailyPickGeneration = async (mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
+  const token = crypto.randomUUID();
+  const params = [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, token];
+
+  try {
+    const inserted = await get(
+      `INSERT INTO daily_analysis_publications
+       (analysis_date, match_mode, provider, cache_version, status, generation_token)
+       VALUES (?, ?, ?, ?, 'generating', ?)
+       ON CONFLICT (analysis_date, match_mode, provider, cache_version) DO NOTHING
+       RETURNING id`,
+      params
+    );
+    if (inserted?.id) return { id: inserted.id, token };
+  } catch (err) {
+    console.error('Erro ao iniciar publicacao diaria de analise:', err.message);
+    return null;
+  }
+
+  const staleBefore = new Date(Date.now() - DAILY_PICK_GENERATION_STALE_MS).toISOString();
+  const updated = await get(
+    `UPDATE daily_analysis_publications
+     SET status = 'generating', generation_token = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE analysis_date = ? AND match_mode = ? AND provider = ? AND cache_version = ?
+       AND status <> 'published'
+       AND (status <> 'generating' OR updated_at < ?)
+     RETURNING id`,
+    [token, getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, staleBefore]
+  );
+
+  return updated?.id ? { id: updated.id, token } : null;
+};
+
+const publishDailyPick = async (claim, data, mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  const payload = JSON.stringify(data);
+  await run(
+    `UPDATE daily_analysis_publications
+     SET status = 'published', payload = ?::jsonb, error = NULL, generated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND generation_token = ?`,
+    [payload, claim.id, claim.token]
+  );
+  await persistLegacyDailyPickCache(data, matchMode);
   const runtimeCache = {
-    cacheKey,
+    cacheKey: getDailyPickCacheKey(matchMode),
     data,
     updatedAt: Date.now(),
     error: null,
+    status: 'published',
   };
 
-  dailyPickRuntimeCaches.set(normalizeMatchMode(mode || data?.matchMode), runtimeCache);
+  dailyPickRuntimeCaches.set(matchMode, runtimeCache);
 
   return runtimeCache;
 };
 
-const refreshDailyPick = async (mode = 'prelive') => {
+const failDailyPickPublication = async (claim, err) => {
+  await run(
+    `UPDATE daily_analysis_publications
+     SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND generation_token = ?`,
+    [err.message, claim.id, claim.token]
+  );
+};
+
+const publishDailyPickIfNeeded = async (mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode);
   const currentPromise = dailyPickRefreshPromises.get(matchMode);
   if (currentPromise) return currentPromise;
 
-  const refreshPromise = fetchDailyAnalysis(matchMode)
-    .then((data) => persistDailyPick(data, matchMode))
+  const refreshPromise = (async () => {
+    const published = await readPublishedDailyPick(matchMode);
+    if (published?.data && hasDailyPickEvents(published)) {
+      dailyPickRuntimeCaches.set(matchMode, published);
+      return published;
+    }
+
+    const claim = await claimDailyPickGeneration(matchMode);
+    if (!claim) {
+      return readPublishedDailyPick(matchMode);
+    }
+
+    try {
+      const data = await fetchDailyAnalysis(matchMode);
+      return publishDailyPick(claim, data, matchMode);
+    } catch (err) {
+      await failDailyPickPublication(claim, err);
+      throw err;
+    }
+  })()
     .catch((err) => {
       const previousCache = dailyPickRuntimeCaches.get(matchMode);
       const failedCache = {
@@ -957,9 +1069,10 @@ const refreshDailyPick = async (mode = 'prelive') => {
         data: previousCache?.data || null,
         updatedAt: previousCache?.updatedAt || 0,
         error: err.message,
+        status: 'failed',
       };
       dailyPickRuntimeCaches.set(matchMode, failedCache);
-      console.error('Erro ao atualizar aposta do dia na API PlacarPro:', err.message);
+      console.error('Erro ao publicar analise diaria na API PlacarPro:', err.message);
       throw err;
     })
     .finally(() => {
@@ -985,20 +1098,50 @@ const ensureDailyPick = async ({ requireAnalysis = false, mode = 'prelive' } = {
   if (
     dailyPickRuntimeCaches.get(matchMode)?.cacheKey === cacheKey
     && dailyPickRuntimeCaches.get(matchMode)?.data
-    && isCacheFresh(dailyPickRuntimeCaches.get(matchMode))
     && hasDailyPickEvents(dailyPickRuntimeCaches.get(matchMode))
     && (!requireAnalysis || hasAiAnalysis(dailyPickRuntimeCaches.get(matchMode)))
   ) {
     return dailyPickRuntimeCaches.get(matchMode);
   }
 
-  const persisted = await readPersistedDailyPick(matchMode);
-  if (persisted?.data && isCacheFresh(persisted) && hasDailyPickEvents(persisted) && (!requireAnalysis || hasAiAnalysis(persisted))) {
-    dailyPickRuntimeCaches.set(matchMode, persisted);
-    return persisted;
+  const published = await readPublishedDailyPick(matchMode);
+  if (published?.data && hasDailyPickEvents(published) && (!requireAnalysis || hasAiAnalysis(published))) {
+    dailyPickRuntimeCaches.set(matchMode, published);
+    return published;
   }
 
-  return refreshDailyPick(matchMode);
+  const state = await readDailyPickPublicationState(matchMode);
+
+  if (!state || DAILY_PICK_ON_DEMAND_ENABLED || state.status === 'failed') {
+    const generated = await publishDailyPickIfNeeded(matchMode).catch((err) => ({
+      cacheKey,
+      data: null,
+      updatedAt: Date.now(),
+      error: err.message,
+      status: 'failed',
+    }));
+
+    if (generated?.data && hasDailyPickEvents(generated) && (!requireAnalysis || hasAiAnalysis(generated))) {
+      return generated;
+    }
+
+    const updatedState = await readDailyPickPublicationState(matchMode);
+    return {
+      cacheKey,
+      data: null,
+      updatedAt: updatedState?.updated_at ? new Date(updatedState.updated_at).getTime() : Date.now(),
+      error: updatedState?.status === 'failed' ? updatedState.error : generated?.error || null,
+      status: updatedState?.status || generated?.status || 'pending',
+    };
+  }
+
+  return {
+    cacheKey,
+    data: null,
+    updatedAt: state?.updated_at ? new Date(state.updated_at).getTime() : 0,
+    error: state?.status === 'failed' ? state.error : null,
+    status: state?.status || 'pending',
+  };
 };
 
 const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
@@ -1026,11 +1169,35 @@ const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
   return {
     aposta_do_dia: apostaDoDia,
     entradas_premium: entradasPremium,
-    aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromises.get(matchMode)),
+    aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromises.get(matchMode)) || activeCache?.status === 'generating' || activeCache?.status === 'pending',
     aposta_do_dia_erro: activeCache?.error || null,
     aposta_do_dia_atualizada_em: activeCache?.updatedAt || null,
     match_mode: matchMode,
   };
+};
+
+const runDailyPickSchedulerTick = async () => {
+  await Promise.all(
+    DAILY_PICK_SCHEDULER_MODES.map((mode) => publishDailyPickIfNeeded(mode).catch((err) => {
+      console.error(`Scheduler de analise diaria falhou para ${mode}:`, err.message);
+      return null;
+    }))
+  );
+};
+
+const startDailyPickScheduler = () => {
+  if (!DAILY_PICK_SCHEDULER_ENABLED || DAILY_PICK_SCHEDULER_MODES.length === 0) return;
+
+  const runTick = () => {
+    runDailyPickSchedulerTick().catch((err) => {
+      console.error('Scheduler de analise diaria falhou:', err.message);
+    });
+  };
+
+  const firstRun = setTimeout(runTick, Math.max(0, DAILY_PICK_SCHEDULER_START_DELAY_MS));
+  const interval = setInterval(runTick, Math.max(60 * 1000, DAILY_PICK_SCHEDULER_INTERVAL_MS));
+  firstRun.unref?.();
+  interval.unref?.();
 };
 
 app.get('/api/health', (_req, res) => {
@@ -1349,6 +1516,9 @@ const analysisQueryParams = (query = {}) => {
     'match',
     'strictMarkets',
     'strictFull',
+    'useLLM',
+    'useLLMExplanation',
+    'explainRejected',
     'includeEnrichment',
     'wait',
   ];
@@ -1908,6 +2078,7 @@ const PORT = process.env.PORT || 3000;
 databaseReady.then(() => {
   const server = app.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
+    startDailyPickScheduler();
   });
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
