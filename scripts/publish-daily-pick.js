@@ -1,0 +1,48 @@
+require('dotenv').config();
+
+const DEFAULT_BASE_URL = `http://localhost:${process.env.PORT || 3000}`;
+
+const args = new Set(process.argv.slice(2));
+const force = args.has('--force');
+const baseUrl = String(process.env.DAILY_PICK_PUBLISH_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
+const secret = String(process.env.DAILY_PICK_PUBLISH_SECRET || '').trim();
+const modes = String(process.env.DAILY_PICK_PUBLISH_MODES || process.env.DAILY_PICK_SCHEDULER_MODES || 'prelive')
+  .split(',')
+  .map((mode) => mode.trim())
+  .filter(Boolean);
+
+if (!secret) {
+  console.error('Defina DAILY_PICK_PUBLISH_SECRET no .env antes de publicar a analise diaria.');
+  process.exit(1);
+}
+
+async function main() {
+  const response = await fetch(`${baseUrl}/api/internal/daily-pick/publish${force ? '?force=true' : ''}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-daily-pick-secret': secret,
+    },
+    body: JSON.stringify({ modes, force }),
+  });
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!response.ok) {
+    console.error('Falha ao publicar analise diaria:', payload.error || payload.raw || response.statusText);
+    process.exit(1);
+  }
+
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+main().catch((err) => {
+  console.error('Erro ao publicar analise diaria:', err.message);
+  process.exit(1);
+});

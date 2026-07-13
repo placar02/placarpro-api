@@ -28,7 +28,8 @@ const SCRAPER_RETRY_ATTEMPTS = Math.max(1, Number(process.env.SCRAPER_RETRY_ATTE
 const SCRAPER_RETRY_DELAY_MS = Math.max(250, Number(process.env.SCRAPER_RETRY_DELAY_MS || 2500));
 const DAILY_PICK_CACHE_VERSION = process.env.DAILY_PICK_CACHE_VERSION || 'v24';
 const DAILY_PICK_GENERATION_STALE_MS = Number(process.env.DAILY_PICK_GENERATION_STALE_MS || 45 * 60 * 1000);
-const DAILY_PICK_SCHEDULER_ENABLED = process.env.DAILY_PICK_SCHEDULER_ENABLED !== 'false';
+const DAILY_PICK_READ_ONLY = process.env.DAILY_PICK_READ_ONLY === 'true';
+const DAILY_PICK_SCHEDULER_ENABLED = !DAILY_PICK_READ_ONLY && process.env.DAILY_PICK_SCHEDULER_ENABLED !== 'false';
 const DAILY_PICK_ON_DEMAND_ENABLED = process.env.DAILY_PICK_ON_DEMAND_ENABLED === 'true';
 const DAILY_PICK_SCHEDULER_INTERVAL_MS = Number(process.env.DAILY_PICK_SCHEDULER_INTERVAL_MS || 10 * 60 * 1000);
 const DAILY_PICK_SCHEDULER_START_DELAY_MS = Number(process.env.DAILY_PICK_SCHEDULER_START_DELAY_MS || 1000);
@@ -1172,6 +1173,54 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
   return runtimeCache;
 };
 
+const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  const payload = JSON.stringify(data);
+
+  await run(
+    `INSERT INTO daily_analysis_publications
+     (analysis_date, match_mode, provider, cache_version, status, payload, error, generated_at, updated_at)
+     VALUES (?, ?, ?, ?, 'published', ?::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT (analysis_date, match_mode, provider, cache_version)
+     DO UPDATE SET
+       status = 'published',
+       payload = EXCLUDED.payload,
+       error = NULL,
+       generation_token = NULL,
+       generated_at = CURRENT_TIMESTAMP,
+       updated_at = CURRENT_TIMESTAMP`,
+    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, payload]
+  );
+
+  await persistLegacyDailyPickCache(data, matchMode);
+
+  const runtimeCache = {
+    cacheKey: getDailyPickCacheKey(matchMode),
+    data,
+    updatedAt: Date.now(),
+    error: null,
+    status: 'published',
+  };
+
+  dailyPickRuntimeCaches.set(matchMode, runtimeCache);
+  return runtimeCache;
+};
+
+const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false } = {}) => {
+  const matchMode = normalizeMatchMode(mode);
+  if (!force) {
+    const published = await readPublishedDailyPick(matchMode);
+    if (published?.data && hasDailyPickEvents(published)) {
+      dailyPickRuntimeCaches.set(matchMode, published);
+      return { ...published, reused: true };
+    }
+  }
+
+  const data = await fetchDailyAnalysis(matchMode);
+  const published = await upsertPublishedDailyPick(data, matchMode);
+  return { ...published, reused: false };
+};
+
 const failDailyPickPublication = async (claim, err) => {
   await run(
     `UPDATE daily_analysis_publications
@@ -1255,6 +1304,18 @@ const ensureDailyPick = async ({ requireAnalysis = false, mode = 'prelive' } = {
   }
 
   const state = await readDailyPickPublicationState(matchMode);
+
+  if (DAILY_PICK_READ_ONLY) {
+    return {
+      cacheKey,
+      data: null,
+      updatedAt: state?.updated_at ? new Date(state.updated_at).getTime() : 0,
+      error: state?.status === 'failed'
+        ? state.error
+        : 'Analise diaria ainda nao publicada.',
+      status: state?.status || 'pending',
+    };
+  }
 
   if (!requireAnalysis) {
     if (!state || DAILY_PICK_ON_DEMAND_ENABLED || state.status === 'failed') {
@@ -1360,6 +1421,61 @@ const startDailyPickScheduler = () => {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+const requireInternalDailyPickSecret = (req, res, next) => {
+  const configuredSecret = String(process.env.DAILY_PICK_PUBLISH_SECRET || '').trim();
+  const receivedSecret = String(req.headers['x-daily-pick-secret'] || req.body?.secret || '').trim();
+
+  if (DAILY_PICK_READ_ONLY || process.env.DAILY_PICK_PUBLISHER_ENABLED === 'false') {
+    return res.status(403).json({ error: 'Publicador de analises desativado nesta API.' });
+  }
+
+  if (!configuredSecret) {
+    return res.status(503).json({ error: 'Publicacao interna de analises nao configurada.' });
+  }
+
+  if (!receivedSecret || receivedSecret !== configuredSecret) {
+    return res.status(401).json({ error: 'Nao autorizado.' });
+  }
+
+  return next();
+};
+
+app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, async (req, res) => {
+  const requestedModes = Array.isArray(req.body?.modes)
+    ? req.body.modes
+    : String(req.body?.mode || process.env.DAILY_PICK_PUBLISH_MODES || 'prelive').split(',');
+  const modes = requestedModes
+    .map((mode) => normalizeMatchMode(mode))
+    .filter((mode, index, list) => list.indexOf(mode) === index);
+  const force = req.body?.force === true || req.query.force === 'true';
+
+  try {
+    const results = [];
+    for (const mode of modes) {
+      const published = await generateAndPublishDailyPick({ mode, force });
+      results.push({
+        mode,
+        status: published.status,
+        reused: Boolean(published.reused),
+        updatedAt: published.updatedAt,
+        selectedEvents: filterEventsForMode(published.data?.selectedEvents || [], mode).length,
+        hasAnalysis: Boolean(published.data?.analysisResult),
+      });
+    }
+
+    res.json({
+      success: true,
+      date: getLocalDateKey(),
+      provider: getDailyPickProvider(),
+      cacheVersion: DAILY_PICK_CACHE_VERSION,
+      results,
+    });
+  } catch (err) {
+    console.error('Erro ao publicar analise diaria manualmente:', err.message);
+    res.status(500).json({ error: err.message || 'Erro ao publicar analise diaria.' });
+  }
 });
 
 const getCheckoutPlan = async (requestedPlanId) => {
