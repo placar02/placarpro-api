@@ -1388,7 +1388,11 @@ const buildDailyPickPayload = (plan, cache = null, mode = 'prelive') => {
   return {
     aposta_do_dia: apostaDoDia,
     entradas_premium: entradasPremium,
-    aposta_do_dia_atualizando: Boolean(dailyPickRefreshPromises.get(matchMode)) || activeCache?.status === 'generating' || activeCache?.status === 'pending',
+    aposta_do_dia_atualizando: !DAILY_PICK_READ_ONLY && (
+      Boolean(dailyPickRefreshPromises.get(matchMode))
+      || activeCache?.status === 'generating'
+      || activeCache?.status === 'pending'
+    ),
     aposta_do_dia_erro: getPublicDailyPickError(activeCache?.error),
     aposta_do_dia_atualizada_em: activeCache?.updatedAt || null,
     match_mode: matchMode,
