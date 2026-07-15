@@ -23,6 +23,8 @@ const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
 const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
 const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
+const DAILY_PICK_MAX_CANDIDATES = Math.max(PREMIUM_ENTRY_LIMIT, Number(process.env.DAILY_PICK_MAX_CANDIDATES || 15));
+const DAILY_PICK_FULL_DAILY_TIMEOUT_MS = Number(process.env.DAILY_PICK_FULL_DAILY_TIMEOUT_MS || 360000);
 const DAILY_PICK_FAST_TIMEOUT_MS = Number(process.env.DAILY_PICK_FAST_TIMEOUT_MS || 20000);
 const SCRAPER_RETRY_ATTEMPTS = Math.max(1, Number(process.env.SCRAPER_RETRY_ATTEMPTS || 3));
 const SCRAPER_RETRY_DELAY_MS = Math.max(250, Number(process.env.SCRAPER_RETRY_DELAY_MS || 2500));
@@ -330,6 +332,17 @@ const isUsableAnalysis = (analysis) => {
   return true;
 };
 
+const isPublishableAnalysis = (analysis) => {
+  if (!analysis || analysis.analysisSource === 'fallback-provider') return false;
+  if (String(analysis.recommendation || '').toLowerCase() === 'error') return false;
+  return Boolean(
+    analysis.rationale
+    || analysis.matchAnalysis
+    || analysis.recommendation
+    || analysis.meta?.decisionAudit
+  );
+};
+
 const summarizeText = (text, maxLength = 220) => {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
@@ -417,18 +430,37 @@ const isUpcomingEvent = (event) => {
   return timestamp * 1000 > Date.now() - 5 * 60 * 1000;
 };
 
-const filterEligibleDailyEvents = (events = []) => events
-  .filter(isTodayUpcomingEvent)
+const deduplicateEventsByFixture = (events = []) => {
+  const unique = new Map();
+
+  for (const event of events) {
+    const normalizeTeam = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+    const home = normalizeTeam(event?.homeTeam?.name || event?.homeTeamName);
+    const away = normalizeTeam(event?.awayTeam?.name || event?.awayTeamName);
+    const timestamp = getEventStartTimestamp(event);
+    const key = home && away && timestamp ? `${home}|${away}|${timestamp}` : `id:${event?.id}`;
+    if (!unique.has(key)) unique.set(key, event);
+  }
+
+  return [...unique.values()];
+};
+
+const filterEligibleDailyEvents = (events = []) => deduplicateEventsByFixture(events.filter(isTodayUpcomingEvent))
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
-const filterUpcomingEvents = (events = []) => events
-  .filter(isUpcomingEvent)
+const filterUpcomingEvents = (events = []) => deduplicateEventsByFixture(events.filter(isUpcomingEvent))
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
 const normalizeMatchMode = (value) => String(value || '').toLowerCase() === 'live' ? 'live' : 'prelive';
 
-const filterLiveEvents = (events = []) => events
-  .filter((event) => event?.id && isLiveStatus(event) && !isFinishedStatus(event))
+const filterLiveEvents = (events = []) => deduplicateEventsByFixture(
+  events.filter((event) => event?.id && isLiveStatus(event) && !isFinishedStatus(event))
+)
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
 const filterEventsForMode = (events = [], mode = 'prelive') => {
@@ -517,7 +549,8 @@ const selectVariedEntries = (analysisResult, events, limit = PREMIUM_ENTRY_LIMIT
   const eventIds = new Set(events.map((event) => String(event.id)));
   const expanded = expandRecommendations(analysisResult, events)
     .filter((entry) => eventIds.has(String(entry.eventId)))
-    .filter((entry) => !isFallbackEntry(entry));
+    .filter((entry) => !isFallbackEntry(entry))
+    .filter(isUsableAnalysis);
   const byEvent = new Map();
 
   for (const entry of expanded) {
@@ -547,6 +580,29 @@ const selectVariedEntries = (analysisResult, events, limit = PREMIUM_ENTRY_LIMIT
   }
 
   return varied;
+};
+
+const selectPublishedAnalyses = (analysisResult, events, limit = PREMIUM_ENTRY_LIMIT) => {
+  const eventIds = new Set(events.map((event) => String(event.id)));
+  const expanded = expandRecommendations(analysisResult, events)
+    .filter((entry) => eventIds.has(String(entry.eventId)))
+    .filter((entry) => !isFallbackEntry(entry))
+    .filter(isPublishableAnalysis);
+  const byEvent = new Map();
+
+  for (const entry of expanded) {
+    const eventId = String(entry.eventId || '');
+    if (!eventId) continue;
+    const current = byEvent.get(eventId);
+    if (!current || Number(entry.confidence || 0) > Number(current.confidence || 0)) {
+      byEvent.set(eventId, entry);
+    }
+  }
+
+  return events
+    .map((event) => byEvent.get(String(event.id)))
+    .filter(Boolean)
+    .slice(0, limit);
 };
 
 const selectBasicEntry = (analysisResult, events) => {
@@ -893,6 +949,30 @@ const enrichEventsWithOdds = async (events = [], limit = 100) => {
   ];
 };
 
+const waitForAnalysisJob = async (initialPayload) => {
+  let payload = initialPayload;
+  const jobId = payload?.jobId;
+  if (!payload?.pending || !jobId) return payload;
+
+  const deadline = Date.now() + DAILY_PICK_ANALYSIS_TIMEOUT_MS;
+
+  while (payload?.pending && Date.now() < deadline) {
+    const delay = Math.max(750, Math.min(5000, Number(payload.pollAfterMs || 1500)));
+    await wait(delay);
+
+    const jobRes = await scraperGet(`/analysis/jobs/${jobId}`, {
+      timeout: Math.max(5000, Math.min(30000, deadline - Date.now())),
+    });
+    payload = jobRes.data;
+  }
+
+  if (payload?.pending) {
+    throw new Error(`Analise ${jobId} ainda em processamento apos timeout.`);
+  }
+
+  return payload;
+};
+
 const analyzeDailyEvents = async (events = []) => {
   const analyses = [];
   let index = 0;
@@ -905,10 +985,15 @@ const analyzeDailyEvents = async (events = []) => {
 
       try {
         const analysisRes = await scraperGet(
-          `/analysis/${event.id}?includeOdds=false&useOddsFallback=false`,
+          `/analysis/${event.id}?includeOdds=false&useOddsFallback=false&wait=true&useLLM=true&useLLMExplanation=true&explainRejected=true`,
           { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
         );
-        const analysis = analysisRes.data?.result;
+        const analysisPayload = await waitForAnalysisJob(analysisRes.data);
+        if (analysisPayload?.ok === false || analysisPayload?.status === 'failed') {
+          throw new Error(analysisPayload.error || 'Analise retornou status de falha.');
+        }
+
+        const analysis = analysisPayload?.result;
         const oddsData = ENABLE_ODDS_ENRICHMENT ? await fetchEventOdds(event.id) : null;
         const enrichedAnalysis = oddsData ? enrichAnalysisWithOdds(analysis, oddsData) : analysis;
 
@@ -933,6 +1018,7 @@ const analyzeDailyEvents = async (events = []) => {
 
 const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) => {
   const matchMode = normalizeMatchMode(mode);
+  let analysisDate = getLocalDateKey();
   let events = [];
   let eligibleEvents = [];
   const fetchErrors = [];
@@ -969,7 +1055,10 @@ const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) =>
       events = matchesRes.data.data || [];
       eligibleEvents = offset === 0 ? filterEligibleDailyEvents(events) : filterUpcomingEvents(events);
 
-      if (eligibleEvents.length > 0) break;
+      if (eligibleEvents.length > 0) {
+        analysisDate = date;
+        break;
+      }
     } catch (err) {
       fetchErrors.push(`${date}: ${err.message}`);
       console.warn(`Nao foi possivel buscar jogos de ${date} para a aposta do dia:`, err.message);
@@ -982,10 +1071,10 @@ const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) =>
       throw new Error(`Nao foi possivel buscar jogos para gerar entradas (${fetchErrors.join(' | ')})`);
     }
 
-    return { matchMode, eligibleEvents: [] };
+    return { matchMode, analysisDate, eligibleEvents: [] };
   }
 
-  return { matchMode, eligibleEvents };
+  return { matchMode, analysisDate, eligibleEvents };
 };
 
 const fetchDailyEventsOnly = async (mode = 'prelive') => {
@@ -1019,33 +1108,128 @@ const getFastDailyPick = async (mode = 'prelive', state = null) => {
 };
 
 const fetchDailyAnalysis = async (mode = 'prelive') => {
-  const { matchMode, eligibleEvents } = await fetchDailyCandidateEvents(mode);
+  const { matchMode, analysisDate, eligibleEvents } = await fetchDailyCandidateEvents(mode);
 
   if (eligibleEvents.length === 0) {
     return { matchMode, selectedEvents: [], analysisResult: null };
   }
 
-  const rankedEvents = ENABLE_ODDS_ENRICHMENT
-    ? await enrichEventsWithOdds(eligibleEvents)
-    : eligibleEvents;
-  const selectedEvents = rankedEvents.slice(0, PREMIUM_ENTRY_LIMIT);
-
   try {
-    const analyses = await analyzeDailyEvents(selectedEvents);
-    const validAnalyses = analyses.filter(isUsableAnalysis).sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+    const params = new URLSearchParams({
+      date: analysisDate,
+      limit: String(PREMIUM_ENTRY_LIMIT),
+      maxCandidates: String(DAILY_PICK_MAX_CANDIDATES),
+      profileCandidateLimit: String(DAILY_PICK_MAX_CANDIDATES),
+      mode: matchMode,
+      strictMarkets: 'false',
+      strictFull: 'false',
+      wait: 'true',
+      useLLM: 'true',
+      useLLMExplanation: 'true',
+      explainRejected: 'true',
+      includeOdds: 'false',
+      useOddsFallback: 'false',
+      fullDailyCacheTtlMs: '0',
+    });
+    const fullDailyRes = await scraperGet(`/analysis/full-daily?${params}`, {
+      timeout: DAILY_PICK_FULL_DAILY_TIMEOUT_MS,
+    });
+    const fullDaily = fullDailyRes.data?.result;
+    if (fullDailyRes.data?.ok === false || !fullDaily || !Array.isArray(fullDaily.analyses)) {
+      throw new Error(fullDailyRes.data?.error || 'Triagem diaria retornou um formato invalido.');
+    }
+
+    const eventById = new Map(eligibleEvents.map((event) => [String(event.id), event]));
+    const selectedEventById = new Map(
+      (Array.isArray(fullDaily.selectedEvents) ? fullDaily.selectedEvents : [])
+        .filter((event) => event?.id)
+        .map((event) => [String(event.id), event])
+    );
+    const selectedIds = (
+      Array.isArray(fullDaily.selectedEventIds) && fullDaily.selectedEventIds.length
+        ? fullDaily.selectedEventIds
+        : Array.from(selectedEventById.keys()).length
+          ? Array.from(selectedEventById.keys())
+          : fullDaily.analyses.map((analysis) => analysis.eventId)
+    ).map(String);
+    const selectedEvents = selectedIds
+      .map((eventId) => eventById.get(eventId) || selectedEventById.get(eventId))
+      .filter(Boolean);
+    if (selectedEvents.length === 0) {
+      throw new Error('Triagem diaria nao selecionou partidas elegiveis para publicacao.');
+    }
+
+    let analyses = fullDaily.analyses.filter((analysis) => selectedIds.includes(String(analysis.eventId)));
+    let analysisRetried = false;
+    if (analyses.length === 0) {
+      analysisRetried = true;
+      console.warn('Triagem concluida sem analises; repetindo somente as partidas selecionadas por qualidade.');
+      analyses = await analyzeDailyEvents(selectedEvents);
+    }
+    let publishableAnalyses = analyses
+      .filter(isPublishableAnalysis)
+      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+    if (publishableAnalyses.length === 0 && !analysisRetried) {
+      analysisRetried = true;
+      console.warn('Triagem retornou analises sem conteudo publicavel; repetindo somente as partidas selecionadas por qualidade.');
+      analyses = await analyzeDailyEvents(selectedEvents);
+      publishableAnalyses = analyses
+        .filter(isPublishableAnalysis)
+        .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+    }
+    const approvedAnalyses = publishableAnalyses.filter(isUsableAnalysis);
+    const primaryAnalysis = approvedAnalyses[0] || publishableAnalyses[0];
 
     return {
       matchMode,
       selectedEvents,
-      analysisResult: validAnalyses.length ? {
-        ...validAnalyses[0],
-        bestEntry: validAnalyses[0].bestEntry || validAnalyses[0],
-        analyses: validAnalyses,
+      analysisResult: primaryAnalysis ? {
+        ...primaryAnalysis,
+        bestEntry: approvedAnalyses[0]?.bestEntry || approvedAnalyses[0] || null,
+        analyses: publishableAnalyses,
       } : null,
+      selection: {
+        strategy: 'data-quality',
+        analysisDate,
+        matchesFound: Number(fullDaily.matchesFound || eligibleEvents.length),
+        candidatesChecked: Number(fullDaily.candidatesChecked || 0),
+        qualifiedMatches: Number(fullDaily.qualifiedMatches || 0),
+        selectedByQuality: selectedEvents.length,
+        analysesPublished: publishableAnalyses.length,
+        approvedEntries: approvedAnalyses.length,
+        analysisRetried,
+        warning: analysisRetried
+          ? `A triagem selecionou ${selectedEvents.length} partida(s) com os melhores dados disponiveis e concluiu a analise em uma nova tentativa.`
+          : fullDaily.warning || null,
+      },
     };
   } catch (err) {
-    console.warn('Analise individual dos jogos de hoje falhou:', err.message);
-    return { matchMode, selectedEvents, analysisResult: null };
+    console.warn('Triagem por qualidade falhou; usando selecao compativel:', err.message);
+    const rankedEvents = ENABLE_ODDS_ENRICHMENT
+      ? await enrichEventsWithOdds(eligibleEvents)
+      : eligibleEvents;
+    const selectedEvents = rankedEvents.slice(0, PREMIUM_ENTRY_LIMIT);
+    const analyses = await analyzeDailyEvents(selectedEvents);
+    const publishableAnalyses = analyses
+      .filter(isPublishableAnalysis)
+      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+    const approvedAnalyses = publishableAnalyses.filter(isUsableAnalysis);
+    const primaryAnalysis = approvedAnalyses[0] || publishableAnalyses[0];
+
+    return {
+      matchMode,
+      selectedEvents,
+      analysisResult: primaryAnalysis ? {
+        ...primaryAnalysis,
+        bestEntry: approvedAnalyses[0]?.bestEntry || approvedAnalyses[0] || null,
+        analyses: publishableAnalyses,
+      } : null,
+      selection: {
+        strategy: 'compatible-fallback',
+        analysisDate,
+        error: err.message,
+      },
+    };
   }
 };
 
@@ -1079,11 +1263,19 @@ const mapDailyPickPublication = (row, mode = 'prelive') => {
 
 const readPublishedDailyPick = async (mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode);
+  return readPublishedDailyPickForDate(getLocalDateKey(), matchMode);
+};
+
+const readPublishedDailyPickForDate = async (date, mode = 'prelive') => {
+  const matchMode = normalizeMatchMode(mode);
+  const analysisDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? String(date) : getLocalDateKey();
   const row = await get(
     `SELECT * FROM daily_analysis_publications
-     WHERE analysis_date = ? AND match_mode = ? AND provider = ? AND cache_version = ? AND status = 'published'
+     WHERE (analysis_date = ? OR payload->'selection'->>'analysisDate' = ?)
+       AND match_mode = ? AND provider = ? AND cache_version = ? AND status = 'published'
+     ORDER BY CASE WHEN analysis_date = ? THEN 0 ELSE 1 END, updated_at DESC
      LIMIT 1`,
-    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION]
+    [analysisDate, analysisDate, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, analysisDate]
   );
 
   try {
@@ -1279,7 +1471,7 @@ const publishDailyPickIfNeeded = async (mode = 'prelive') => {
 const hasAiAnalysis = (cache) => {
   const selectedEvents = filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode);
   if (!cache?.data?.analysisResult || selectedEvents.length === 0) return false;
-  return selectVariedEntries(cache.data.analysisResult, selectedEvents, PREMIUM_ENTRY_LIMIT).length > 0;
+  return selectPublishedAnalyses(cache.data.analysisResult, selectedEvents, PREMIUM_ENTRY_LIMIT).length > 0;
 };
 
 const hasDailyPickEvents = (cache) => filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode).length > 0;
@@ -1466,6 +1658,7 @@ app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, asy
         updatedAt: published.updatedAt,
         selectedEvents: filterEventsForMode(published.data?.selectedEvents || [], mode).length,
         hasAnalysis: Boolean(published.data?.analysisResult),
+        selection: published.data?.selection || null,
       });
     }
 
@@ -1829,6 +2022,124 @@ const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
   }
 };
 
+const normalizeSearchText = (value) => String(value || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, ' ')
+  .trim();
+
+const eventMatchesTeams = (event, home, away) => {
+  const homeQuery = normalizeSearchText(home);
+  const awayQuery = normalizeSearchText(away);
+  const homeName = normalizeSearchText(event?.homeTeam?.name || event?.homeTeamName);
+  const awayName = normalizeSearchText(event?.awayTeam?.name || event?.awayTeamName);
+  if (!homeQuery || !awayQuery) return false;
+  return (
+    (homeName.includes(homeQuery) && awayName.includes(awayQuery))
+    || (homeName.includes(awayQuery) && awayName.includes(homeQuery))
+  );
+};
+
+const eventMatchesTournament = (event, name) => {
+  const query = normalizeSearchText(name);
+  const tournament = normalizeSearchText(event?.tournament?.name || event?.tournamentName);
+  return Boolean(query && tournament.includes(query));
+};
+
+const toAnalysisCenterEntry = (entry, events = []) => {
+  if (!entry) return null;
+  const event = events.find((item) => String(item.id) === String(entry.eventId));
+  const homeTeam = {
+    name: sanitizeProviderText(event?.homeTeam?.name || entry.homeTeamName || entry.homeTeam?.name, 'Casa'),
+    imageUrl: getTeamImageUrl(event?.homeTeam) || entry.homeTeamImageUrl || entry.homeTeam?.imageUrl || null,
+  };
+  const awayTeam = {
+    name: sanitizeProviderText(event?.awayTeam?.name || entry.awayTeamName || entry.awayTeam?.name, 'Fora'),
+    imageUrl: getTeamImageUrl(event?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
+  };
+  const rationale = entry.fullRationale || entry.rationale || entry.analysisSummary || '';
+
+  return {
+    ...entry,
+    eventId: entry.eventId || event?.id,
+    homeTeam,
+    awayTeam,
+    homeTeamName: homeTeam.name,
+    awayTeamName: awayTeam.name,
+    tournamentName: sanitizeProviderText(event?.tournament?.name || entry.tournamentName, ''),
+    startTimestamp: event?.startTimestamp || entry.startTimestamp || null,
+    status: event?.status || entry.status || null,
+    rationale,
+    matchAnalysis: entry.matchAnalysis || rationale,
+    bestEntry: {
+      ...entry,
+      eventId: entry.eventId || event?.id,
+      homeTeam,
+      awayTeam,
+      rationale,
+    },
+  };
+};
+
+const buildPublishedAnalysisResponse = async ({ date, mode = 'prelive', limit = PREMIUM_ENTRY_LIMIT, filterEvents } = {}) => {
+  const matchMode = normalizeMatchMode(mode);
+  const requestedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? String(date) : getLocalDateKey();
+  const published = await readPublishedDailyPickForDate(requestedDate, matchMode);
+
+  if (!published?.data || !hasDailyPickEvents(published)) {
+    const state = await readDailyPickPublicationState(matchMode);
+    return {
+      ok: false,
+      error: state?.status === 'failed'
+        ? getPublicDailyPickError(state.error)
+        : 'Analise ainda nao publicada para esta data. Rode o worker diario para publicar no PostgreSQL.',
+      date: requestedDate,
+      source: 'postgres',
+    };
+  }
+
+  const events = filterEventsForMode(published.data.selectedEvents || [], matchMode)
+    .filter((event) => !filterEvents || filterEvents(event));
+  const analysisResult = events.length ? published.data.analysisResult : null;
+
+  if (!analysisResult) {
+    return {
+      ok: false,
+      error: 'A publicacao encontrada nao possui analise premium para os filtros informados.',
+      date: requestedDate,
+      source: 'postgres',
+    };
+  }
+
+  const entries = selectPublishedAnalyses(analysisResult, events, Math.max(1, Number(limit || PREMIUM_ENTRY_LIMIT)))
+    .map((entry) => toAnalysisCenterEntry(entry, events))
+    .filter(Boolean);
+
+  if (!entries.length) {
+    return {
+      ok: false,
+      error: 'Nenhuma analise publicada corresponde aos filtros informados.',
+      date: requestedDate,
+      source: 'postgres',
+    };
+  }
+
+  return {
+    ok: true,
+    source: 'postgres',
+    result: {
+      date: requestedDate,
+      matchMode,
+      entries,
+      analyses: entries,
+      bestEntry: entries[0]?.bestEntry || entries[0],
+      bestEventId: entries[0]?.eventId,
+      generatedAt: published.updatedAt ? new Date(published.updatedAt).toISOString() : null,
+    },
+  };
+};
+
 // Uma partida ou exatamente tres IDs separados por virgula.
 app.get('/api/analysis/events/:eventIds', authenticateToken, requirePremium, async (req, res) => {
   const eventIds = String(req.params.eventIds || '')
@@ -1838,6 +2149,16 @@ app.get('/api/analysis/events/:eventIds', authenticateToken, requirePremium, asy
 
   if (![1, 3].includes(eventIds.length) || eventIds.some((id) => !/^\d+$/.test(id))) {
     return res.status(400).json({ error: 'Informe 1 ID ou exatamente 3 IDs numericos do OGOL.' });
+  }
+
+  if (DAILY_PICK_READ_ONLY) {
+    const response = await buildPublishedAnalysisResponse({
+      date: req.query.date,
+      mode: req.query.mode,
+      limit: eventIds.length,
+      filterEvents: (event) => eventIds.includes(String(event.id)),
+    });
+    return res.status(response.ok ? 200 : 404).json(response);
   }
 
   return proxyAnalysis(req, res, `/analysis/${eventIds.join(',')}`);
@@ -1851,10 +2172,29 @@ app.get('/api/analysis/by-teams', authenticateToken, requirePremium, async (req,
     return res.status(400).json({ error: 'Informe os dois times da partida.' });
   }
 
+  if (DAILY_PICK_READ_ONLY) {
+    const response = await buildPublishedAnalysisResponse({
+      date: req.query.date,
+      mode: req.query.mode,
+      limit: 1,
+      filterEvents: (event) => eventMatchesTeams(event, home, away),
+    });
+    return res.status(response.ok ? 200 : 404).json(response);
+  }
+
   return proxyAnalysis(req, res, '/analysis/by-teams');
 });
 
 app.get('/api/analysis/daily', authenticateToken, requirePremium, async (req, res) => {
+  if (DAILY_PICK_READ_ONLY) {
+    const response = await buildPublishedAnalysisResponse({
+      date: req.query.date,
+      mode: req.query.mode,
+      limit: req.query.limit,
+    });
+    return res.status(response.ok ? 200 : 404).json(response);
+  }
+
   return proxyAnalysis(req, res, '/analysis/full-daily');
 });
 
@@ -1863,12 +2203,29 @@ app.get('/api/analysis/jobs/:jobId', authenticateToken, requirePremium, async (r
   if (!/^[a-f0-9-]{36}$/i.test(jobId)) {
     return res.status(400).json({ error: 'Job de analise invalido.' });
   }
+  if (DAILY_PICK_READ_ONLY) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Jobs de analise nao existem no Render em modo somente PostgreSQL.',
+    });
+  }
   return proxyAnalysis(req, res, `/analysis/jobs/${jobId}`);
 });
 
 app.get('/api/analysis/tournament', authenticateToken, requirePremium, async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (name.length < 2) return res.status(400).json({ error: 'Informe o nome do campeonato.' });
+
+  if (DAILY_PICK_READ_ONLY) {
+    const response = await buildPublishedAnalysisResponse({
+      date: req.query.date,
+      mode: req.query.mode,
+      limit: req.query.limit,
+      filterEvents: (event) => eventMatchesTournament(event, name),
+    });
+    return res.status(response.ok ? 200 : 404).json(response);
+  }
+
   return proxyAnalysis(req, res, '/analysis/tournament');
 });
 
@@ -1877,6 +2234,16 @@ app.get('/api/analysis/tournament/:tournamentId', authenticateToken, requirePrem
 
   if (!/^\d+$/.test(tournamentId)) {
     return res.status(400).json({ error: 'Informe um ID de campeonato valido.' });
+  }
+
+  if (DAILY_PICK_READ_ONLY) {
+    const response = await buildPublishedAnalysisResponse({
+      date: req.query.date,
+      mode: req.query.mode,
+      limit: req.query.limit,
+      filterEvents: (event) => String(event?.tournament?.id || '') === tournamentId,
+    });
+    return res.status(response.ok ? 200 : 404).json(response);
   }
 
   return proxyAnalysis(req, res, `/analysis/tournament/${tournamentId}`);
