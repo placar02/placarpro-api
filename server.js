@@ -343,6 +343,35 @@ const isPublishableAnalysis = (analysis) => {
   );
 };
 
+const analysisExpectedValue = (analysis) => {
+  const value = Number(
+    analysis?.bestEntry?.meta?.expectedValue
+    ?? analysis?.meta?.expectedValue
+    ?? analysis?.meta?.decisionAudit?.candidates?.find((candidate) => candidate?.rejectionReasons?.length === 0)?.expectedValue
+  );
+  return Number.isFinite(value) ? value : null;
+};
+
+const comparePublishedAnalyses = (left, right) => {
+  const leftConfidence = Number(left?.confidence || 0);
+  const rightConfidence = Number(right?.confidence || 0);
+  if ((leftConfidence > 0) !== (rightConfidence > 0)) return leftConfidence > 0 ? -1 : 1;
+
+  const confidenceGap = leftConfidence - rightConfidence;
+  if (Math.abs(confidenceGap) > 5) return confidenceGap > 0 ? -1 : 1;
+
+  const leftEv = analysisExpectedValue(left);
+  const rightEv = analysisExpectedValue(right);
+  if (leftEv !== null && rightEv !== null && Math.abs(leftEv - rightEv) > 0.05) return rightEv - leftEv;
+
+  const leftPriority = Number(left?.championshipPriority?.score ?? left?.dataProfile?.championshipPriority?.score ?? 20);
+  const rightPriority = Number(right?.championshipPriority?.score ?? right?.dataProfile?.championshipPriority?.score ?? 20);
+  if (leftPriority !== rightPriority) return rightPriority - leftPriority;
+  if (confidenceGap !== 0) return confidenceGap > 0 ? -1 : 1;
+  if (leftEv !== null && rightEv !== null && leftEv !== rightEv) return rightEv - leftEv;
+  return Number(right?.dataProfile?.score || 0) - Number(left?.dataProfile?.score || 0);
+};
+
 const summarizeText = (text, maxLength = 220) => {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
@@ -995,7 +1024,10 @@ const analyzeDailyEvents = async (events = []) => {
 
         const analysis = analysisPayload?.result;
         const oddsData = ENABLE_ODDS_ENRICHMENT ? await fetchEventOdds(event.id) : null;
-        const enrichedAnalysis = oddsData ? enrichAnalysisWithOdds(analysis, oddsData) : analysis;
+        const enrichedAnalysis = {
+          ...(oddsData ? enrichAnalysisWithOdds(analysis, oddsData) : analysis),
+          championshipPriority: analysis?.championshipPriority || event?.championshipPriority,
+        };
 
         if (ENABLE_ODDS_ENRICHMENT && !hasRealOddEntry(enrichedAnalysis, [event])) {
           console.warn(`Analise da IA para o evento ${event.id} veio sem odd real casada.`);
@@ -1153,7 +1185,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
           : fullDaily.analyses.map((analysis) => analysis.eventId)
     ).map(String);
     const selectedEvents = selectedIds
-      .map((eventId) => eventById.get(eventId) || selectedEventById.get(eventId))
+      .map((eventId) => selectedEventById.get(eventId) || eventById.get(eventId))
       .filter(Boolean);
     if (selectedEvents.length === 0) {
       throw new Error('Triagem diaria nao selecionou partidas elegiveis para publicacao.');
@@ -1168,14 +1200,14 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     }
     let publishableAnalyses = analyses
       .filter(isPublishableAnalysis)
-      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+      .sort(comparePublishedAnalyses);
     if (publishableAnalyses.length === 0 && !analysisRetried) {
       analysisRetried = true;
       console.warn('Triagem retornou analises sem conteudo publicavel; repetindo somente as partidas selecionadas por qualidade.');
       analyses = await analyzeDailyEvents(selectedEvents);
       publishableAnalyses = analyses
         .filter(isPublishableAnalysis)
-        .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+        .sort(comparePublishedAnalyses);
     }
     const approvedAnalyses = publishableAnalyses.filter(isUsableAnalysis);
     const primaryAnalysis = approvedAnalyses[0] || publishableAnalyses[0];
@@ -1198,6 +1230,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
         analysesPublished: publishableAnalyses.length,
         approvedEntries: approvedAnalyses.length,
         analysisRetried,
+        championshipPriority: fullDaily.prioritySummary || null,
         warning: analysisRetried
           ? `A triagem selecionou ${selectedEvents.length} partida(s) com os melhores dados disponiveis e concluiu a analise em uma nova tentativa.`
           : fullDaily.warning || null,
@@ -1212,7 +1245,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     const analyses = await analyzeDailyEvents(selectedEvents);
     const publishableAnalyses = analyses
       .filter(isPublishableAnalysis)
-      .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+      .sort(comparePublishedAnalyses);
     const approvedAnalyses = publishableAnalyses.filter(isUsableAnalysis);
     const primaryAnalysis = approvedAnalyses[0] || publishableAnalyses[0];
 
