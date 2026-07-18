@@ -1,19 +1,30 @@
 const express = require('express');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const axios = require('axios');
 const crypto = require('crypto');
 require('dotenv').config();
 
-const { ready: databaseReady, run, get, all } = require('./db');
+const { validateEnvironment } = require('./config/environment');
+validateEnvironment();
+
+const { pool, ready: databaseReady, run, get, all, transaction } = require('./db');
 const adminRoutes = require('./routes/admin');
+const {
+  authenticateToken,
+  clearSessionCookie,
+  csrfForSession,
+  issueSessionToken,
+  setSessionCookie,
+} = require('./middlewares/auth');
 const { analysisMarketFamily, settlePredictionOutcome } = require('./services/analysisAccuracy');
+const { assertDailyPickPublication } = require('./services/dailyPickContract');
+const logger = require('./services/logger');
+const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
 
 const app = express();
 app.disable('x-powered-by');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-betleverage-key-2026';
 const FRONTEND_URL = process.env.FRONTEND_URL ;
 const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL ;
 const MERCADOPAGO_API_URL = 'https://api.mercadopago.com';
@@ -63,6 +74,17 @@ app.use(cors({
 }));
 
 app.use((req, res, next) => {
+  const requestId = String(req.headers['x-request-id'] || crypto.randomUUID());
+  const startedAt = Date.now();
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  res.on('finish', () => logger.info('http_request', {
+    requestId,
+    method: req.method,
+    path: req.originalUrl.split('?')[0],
+    status: res.statusCode,
+    durationMs: Date.now() - startedAt,
+  }));
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -74,6 +96,11 @@ app.use((req, res, next) => {
 const rateLimitBuckets = new Map();
 const rateLimit = ({ windowMs, max, keyPrefix }) => (req, res, next) => {
   const now = Date.now();
+  if (rateLimitBuckets.size > 5000) {
+    for (const [bucketKey, value] of rateLimitBuckets) {
+      if (now > value.resetAt) rateLimitBuckets.delete(bucketKey);
+    }
+  }
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const key = `${keyPrefix}:${ip}`;
   const bucket = rateLimitBuckets.get(key);
@@ -97,30 +124,6 @@ app.use(express.json({
     req.rawBody = buf.toString('utf8');
   },
 }));
-
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, JWT_SECRET, async (err, user) => {
-    if (err) return res.sendStatus(403);
-    try {
-      const account = await get('SELECT id, email, role, plano, status FROM users WHERE id = ?', [user.id]);
-      if (!account || account.status === 'blocked') return res.status(403).json({ error: 'Acesso negado.' });
-      if (user.sid) {
-        const session = await get('SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.sid, user.id]);
-        if (!session) return res.status(403).json({ error: 'Sessao expirada ou encerrada.' });
-        await run('UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?', [user.sid]);
-      }
-      req.user = { ...user, role: account.role || (account.plano === 'premium' ? 'premium' : 'free') };
-      return next();
-    } catch (databaseError) {
-      return next(databaseError);
-    }
-  });
-};
 
 const requirePremium = async (req, res, next) => {
   try {
@@ -946,38 +949,38 @@ const isPublicHttpsUrl = (value) => {
 const activatePremiumFromPayment = async (payment) => {
   const externalId = payment?.external_reference || payment?.externalReference || payment?.metadata?.external_id;
   const preferenceId = payment?.preference_id || payment?.preferenceId;
-  const session = externalId
-    ? await get('SELECT * FROM payment_sessions WHERE external_id = ?', [externalId])
-    : await get('SELECT * FROM payment_sessions WHERE checkout_id = ?', [preferenceId]);
+  return transaction(async (tx) => {
+    const session = externalId
+      ? await tx.get('SELECT * FROM payment_sessions WHERE external_id = ? FOR UPDATE', [externalId])
+      : await tx.get('SELECT * FROM payment_sessions WHERE checkout_id = ? FOR UPDATE', [preferenceId]);
 
-  if (!session) return null;
+    if (!session) return null;
 
-  await run(
-    'UPDATE payment_sessions SET status = ?, raw_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-    [payment.status || 'pending', JSON.stringify(payment), session.id]
-  );
+    await tx.run(
+      'UPDATE payment_sessions SET status = ?, raw_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [payment.status || 'pending', JSON.stringify(payment), session.id]
+    );
 
-  if (isPaidStatus(payment.status)) {
-    const [plan, settings] = await Promise.all([
-      session.plan_id ? get('SELECT billing_period FROM plans WHERE id = ?', [session.plan_id]) : null,
-      get('SELECT max_accesses FROM payment_settings WHERE id = 1'),
-    ]);
+    if (!isPaidStatus(payment.status)) return session;
+
+    const plan = session.plan_id ? await tx.get('SELECT billing_period FROM plans WHERE id = ?', [session.plan_id]) : null;
+    const settings = await tx.get('SELECT max_accesses FROM payment_settings WHERE id = 1');
     const periodDays = { monthly: 30, quarterly: 90, yearly: 365 }[plan?.billing_period];
     const endsAt = periodDays ? new Date(Date.now() + periodDays * 86400000) : null;
-    await run("UPDATE users SET plano = 'premium', role = CASE WHEN role = 'admin' THEN 'admin' ELSE 'premium' END, plan_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [session.plan_id, session.user_id]);
-    const activeSubscription = await get("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [session.user_id]);
+    await tx.run("UPDATE users SET plano = 'premium', role = CASE WHEN role = 'admin' THEN 'admin' ELSE 'premium' END, plan_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [session.plan_id, session.user_id]);
+    const activeSubscription = await tx.get("SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1 FOR UPDATE", [session.user_id]);
     if (!activeSubscription) {
-      await run('INSERT INTO subscriptions (user_id, plan_id, status, ends_at, access_limit) VALUES (?, ?, ?, ?, ?)', [session.user_id, session.plan_id, 'active', endsAt, settings?.max_accesses || 1]);
+      await tx.run('INSERT INTO subscriptions (user_id, plan_id, status, ends_at, access_limit) VALUES (?, ?, ?, ?, ?)', [session.user_id, session.plan_id, 'active', endsAt, settings?.max_accesses || 1]);
     } else {
-      await run('UPDATE subscriptions SET plan_id = ?, ends_at = ?, access_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.plan_id, endsAt, settings?.max_accesses || 1, activeSubscription.id]);
+      await tx.run('UPDATE subscriptions SET plan_id = ?, ends_at = ?, access_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.plan_id, endsAt, settings?.max_accesses || 1, activeSubscription.id]);
     }
     if (session.coupon_id && !session.coupon_redeemed) {
-      const redeemed = await run('UPDATE payment_sessions SET coupon_redeemed = TRUE WHERE id = ? AND coupon_redeemed = FALSE', [session.id]);
-      if (redeemed.changes) await run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.coupon_id]);
+      const redeemed = await tx.run('UPDATE payment_sessions SET coupon_redeemed = TRUE WHERE id = ? AND coupon_redeemed = FALSE', [session.id]);
+      if (redeemed.changes) await tx.run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.coupon_id]);
     }
-  }
 
-  return session;
+    return session;
+  });
 };
 
 const getMercadoPagoPaymentById = async (paymentId) => {
@@ -1654,6 +1657,7 @@ const claimDailyPickGeneration = async (mode = 'prelive') => {
 
 const publishDailyPick = async (claim, data, mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  assertDailyPickPublication(data);
   const payload = JSON.stringify(data);
   await run(
     `UPDATE daily_analysis_publications
@@ -1680,6 +1684,7 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
 
 const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  assertDailyPickPublication(data);
   const payload = JSON.stringify(data);
 
   await run(
@@ -1937,8 +1942,45 @@ const startDailyPickScheduler = () => {
   interval.unref?.();
 };
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+app.get('/api/health', async (_req, res) => {
+  try {
+    const [database, worker, publication] = await Promise.all([
+      get('SELECT CURRENT_TIMESTAMP AS now'),
+      get("SELECT worker_name, status, last_seen_at FROM worker_heartbeats WHERE worker_name = 'daily-pick-publisher'"),
+      get("SELECT analysis_date, status, updated_at FROM daily_analysis_publications WHERE match_mode = 'prelive' ORDER BY updated_at DESC LIMIT 1"),
+    ]);
+    const workerAgeHours = worker?.last_seen_at
+      ? (Date.now() - new Date(worker.last_seen_at).getTime()) / (60 * 60 * 1000)
+      : null;
+    const workerHealthy = workerAgeHours !== null && workerAgeHours <= Number(process.env.WORKER_HEARTBEAT_MAX_AGE_HOURS || 36);
+    res.json({
+      ok: Boolean(database),
+      status: workerHealthy || DAILY_PICK_READ_ONLY === false ? 'healthy' : 'degraded',
+      database: { ok: Boolean(database) },
+      dailyPickWorker: worker ? { ...worker, healthy: workerHealthy, ageHours: Number(workerAgeHours.toFixed(2)) } : { healthy: false, status: 'never_seen' },
+      latestPublication: publication || null,
+    });
+  } catch (error) {
+    res.status(503).json({ ok: false, database: { ok: false }, error: 'Health check indisponivel.' });
+  }
+});
+
+const requireWorkerSecret = (req, res, next) => {
+  const configuredSecret = String(process.env.DAILY_PICK_PUBLISH_SECRET || '').trim();
+  const receivedSecret = String(req.headers['x-daily-pick-secret'] || '').trim();
+  if (!configuredSecret) return res.status(503).json({ error: 'Heartbeat do worker nao configurado.' });
+  if (!receivedSecret || receivedSecret !== configuredSecret) return res.status(401).json({ error: 'Nao autorizado.' });
+  return next();
+};
+
+app.post('/api/internal/worker/heartbeat', requireWorkerSecret, async (req, res) => {
+  const status = ['starting', 'healthy', 'failed'].includes(req.body?.status) ? req.body.status : 'healthy';
+  const details = req.body?.details && typeof req.body.details === 'object' ? req.body.details : {};
+  await run(`INSERT INTO worker_heartbeats (worker_name, status, details, last_seen_at, updated_at)
+    VALUES ('daily-pick-publisher', ?, ?::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT (worker_name) DO UPDATE SET status = EXCLUDED.status, details = EXCLUDED.details,
+      last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP`, [status, JSON.stringify(details)]);
+  res.json({ success: true, status });
 });
 
 const requireInternalDailyPickSecret = (req, res, next) => {
@@ -2127,8 +2169,10 @@ app.post('/api/auth/register', async (req, res) => {
 
     const sessionId = crypto.randomUUID();
     await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, result.id]);
-    const token = jwt.sign({ id: result.id, email, role: 'free', sid: sessionId }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: result.id, nome, email, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 } });
+    const user = { id: result.id, nome, email, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 };
+    const token = issueSessionToken(user, sessionId);
+    setSessionCookie(res, token);
+    res.json({ csrfToken: csrfForSession(sessionId), user });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Erro interno do servidor' });
@@ -2164,9 +2208,10 @@ app.post('/api/auth/login', async (req, res) => {
     const userRole = user.role || (user.plano === 'premium' ? 'premium' : 'free');
     const sessionId = crypto.randomUUID();
     await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, user.id]);
-    const token = jwt.sign({ id: user.id, email: user.email, role: userRole, sid: sessionId }, JWT_SECRET, { expiresIn: '24h' });
+    const token = issueSessionToken({ id: user.id, email: user.email, role: userRole }, sessionId);
+    setSessionCookie(res, token);
     res.json({
-      token,
+      csrfToken: csrfForSession(sessionId),
       user: {
         id: user.id,
         nome: user.nome,
@@ -2258,6 +2303,7 @@ app.get('/api/daily-pick', authenticateToken, async (req, res) => {
 
 app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   if (req.user.sid) await run('UPDATE user_sessions SET revoked = TRUE WHERE id = ? AND user_id = ?', [req.user.sid, req.user.id]);
+  clearSessionCookie(res);
   res.json({ success: true });
 });
 
@@ -2268,6 +2314,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     if (user.status === 'blocked') return res.status(403).json({ error: 'Usuario bloqueado.' });
 
     res.json({
+      csrfToken: req.user.sid ? csrfForSession(req.user.sid) : null,
       user: {
         id: user.id,
         nome: user.nome,
@@ -2823,7 +2870,7 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       '/v1/payments',
       paymentPayload,
       null,
-      { 'X-Idempotency-Key': crypto.randomUUID() }
+      { 'X-Idempotency-Key': `pix-${externalId}` }
     );
     const transactionData = payment?.point_of_interaction?.transaction_data || {};
 
@@ -2919,7 +2966,7 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       '/v1/payments',
       paymentPayload,
       null,
-      { 'X-Idempotency-Key': crypto.randomUUID() }
+      { 'X-Idempotency-Key': `card-${externalId}` }
     );
 
     await run(
@@ -3049,16 +3096,39 @@ app.post('/api/payments/session/:externalId/simulate-approval', authenticateToke
 
 app.post('/api/payments/webhook', async (req, res) => {
   try {
-    if (process.env.MERCADOPAGO_WEBHOOK_SECRET && req.query.webhookSecret !== process.env.MERCADOPAGO_WEBHOOK_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
     const topic = req.query.topic || req.query.type || req.body?.type;
     const paymentId = req.query.id || req.query['data.id'] || req.body?.data?.id;
+    const webhookSecret = process.env.MERCADOPAGO_WEBHOOK_SECRET;
+
+    if (webhookSecret) {
+      const verification = verifyMercadoPagoSignature({
+        dataId: paymentId,
+        requestId: req.headers['x-request-id'],
+        signature: req.headers['x-signature'],
+        secret: webhookSecret,
+        toleranceSeconds: Number(process.env.MERCADOPAGO_WEBHOOK_TOLERANCE_SECONDS || 300),
+      });
+      const legacyLocalTest = process.env.NODE_ENV !== 'production' && req.query.webhookSecret === webhookSecret;
+      if (!verification.valid && !legacyLocalTest) {
+        logger.warn('mercadopago_webhook_rejected', { requestId: req.requestId, reason: verification.reason });
+        return res.status(401).json({ error: 'Assinatura do webhook invalida.' });
+      }
+    }
 
     if (String(topic).includes('payment') && paymentId) {
+      const eventKey = String(paymentId);
+      const claimed = await run(`INSERT INTO webhook_events (provider, event_key, status)
+        VALUES ('mercadopago', ?, 'processing') ON CONFLICT (provider, event_key) DO NOTHING`, [eventKey]);
+      if (!claimed.changes) return res.json({ received: true, duplicate: true });
+
       const payment = await getMercadoPagoPaymentById(paymentId);
-      await activatePremiumFromPayment(payment);
+      try {
+        await activatePremiumFromPayment(payment);
+        await run("UPDATE webhook_events SET status = 'processed', updated_at = CURRENT_TIMESTAMP WHERE provider = 'mercadopago' AND event_key = ?", [eventKey]);
+      } catch (processingError) {
+        await run("DELETE FROM webhook_events WHERE provider = 'mercadopago' AND event_key = ?", [eventKey]);
+        throw processingError;
+      }
     }
 
     res.json({ received: true });
@@ -3068,12 +3138,37 @@ app.post('/api/payments/webhook', async (req, res) => {
   }
 });
 
+app.use((error, req, res, _next) => {
+  logger.error('unhandled_request_error', {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.originalUrl?.split('?')[0],
+    error: error.message,
+  });
+  if (res.headersSent) return res.end();
+  const status = error.message === 'Origem nao autorizada pelo CORS' ? 403 : 500;
+  return res.status(status).json({
+    error: status === 403 ? error.message : 'Erro interno do servidor.',
+    requestId: req.requestId,
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 databaseReady.then(() => {
   const server = app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+    logger.info('server_started', { port: Number(PORT), environment: process.env.NODE_ENV || 'development' });
     startDailyPickScheduler();
   });
+  const shutdown = (signal) => {
+    logger.info('server_shutdown_started', { signal });
+    server.close(async () => {
+      await pool.end().catch((error) => logger.error('database_shutdown_failed', { error: error.message }));
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10000).unref();
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       console.error(`Porta ${PORT} ja esta em uso. Feche a API antiga ou rode: npm run start:local`);
@@ -3083,6 +3178,6 @@ databaseReady.then(() => {
     process.exitCode = 1;
   });
 }).catch((err) => {
-  console.error('API nao iniciada porque o PostgreSQL falhou:', err.message);
+  logger.error('server_startup_failed', { error: err.message });
   process.exitCode = 1;
 });

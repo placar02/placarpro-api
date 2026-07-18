@@ -129,4 +129,30 @@ const all = async (sql, params = []) => {
   return res.rows;
 };
 
-module.exports = { pool, ready, run, get, all };
+const transaction = async (callback) => {
+  const client = await pool.connect();
+  const txRun = async (sql, params = []) => {
+    let finalSql = convertSql(sql);
+    if (sql.trim().toUpperCase().startsWith('INSERT') && !sql.toUpperCase().includes('RETURNING')) {
+      finalSql += ' RETURNING id';
+    }
+    const result = await client.query(finalSql, params);
+    return { id: result.rows[0]?.id || null, changes: result.rowCount };
+  };
+  const txGet = async (sql, params = []) => (await client.query(convertSql(sql), params)).rows[0];
+  const txAll = async (sql, params = []) => (await client.query(convertSql(sql), params)).rows;
+
+  try {
+    await client.query('BEGIN');
+    const result = await callback({ run: txRun, get: txGet, all: txAll });
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = { pool, ready, run, get, all, transaction };
