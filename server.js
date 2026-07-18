@@ -8,6 +8,7 @@ require('dotenv').config();
 
 const { ready: databaseReady, run, get, all } = require('./db');
 const adminRoutes = require('./routes/admin');
+const { analysisMarketFamily, settlePredictionOutcome } = require('./services/analysisAccuracy');
 
 const app = express();
 app.disable('x-powered-by');
@@ -28,7 +29,7 @@ const DAILY_PICK_FULL_DAILY_TIMEOUT_MS = Number(process.env.DAILY_PICK_FULL_DAIL
 const DAILY_PICK_FAST_TIMEOUT_MS = Number(process.env.DAILY_PICK_FAST_TIMEOUT_MS || 20000);
 const SCRAPER_RETRY_ATTEMPTS = Math.max(1, Number(process.env.SCRAPER_RETRY_ATTEMPTS || 3));
 const SCRAPER_RETRY_DELAY_MS = Math.max(250, Number(process.env.SCRAPER_RETRY_DELAY_MS || 2500));
-const DAILY_PICK_CACHE_VERSION = process.env.DAILY_PICK_CACHE_VERSION || 'v24';
+const DAILY_PICK_CACHE_VERSION = process.env.DAILY_PICK_CACHE_VERSION || 'v25';
 const DAILY_PICK_GENERATION_STALE_MS = Number(process.env.DAILY_PICK_GENERATION_STALE_MS || 45 * 60 * 1000);
 const DAILY_PICK_READ_ONLY = process.env.DAILY_PICK_READ_ONLY === 'true';
 const DAILY_PICK_SCHEDULER_ENABLED = !DAILY_PICK_READ_ONLY && process.env.DAILY_PICK_SCHEDULER_ENABLED !== 'false';
@@ -40,6 +41,10 @@ const DAILY_PICK_SCHEDULER_MODES = (process.env.DAILY_PICK_SCHEDULER_MODES || 'p
   .map((mode) => String(mode || '').toLowerCase() === 'live' ? 'live' : 'prelive')
   .filter((mode, index, modes) => modes.indexOf(mode) === index);
 const ENABLE_ODDS_ENRICHMENT = process.env.ENABLE_ODDS_ENRICHMENT === 'true';
+const DAILY_PICK_REQUIRE_REAL_ODDS = process.env.DAILY_PICK_REQUIRE_REAL_ODDS !== 'false';
+const DAILY_PICK_MIN_EXPECTED_VALUE = Math.max(0, Number(process.env.DAILY_PICK_MIN_EXPECTED_VALUE || 0.05));
+const DAILY_PICK_POLICY_VERSION = process.env.DAILY_PICK_POLICY_VERSION || 'accuracy-v1';
+const ANALYSIS_CALIBRATION_MIN_SAMPLE = Math.max(10, Number(process.env.ANALYSIS_CALIBRATION_MIN_SAMPLE || 30));
 
 const dailyPickRefreshPromises = new Map();
 const dailyPickRuntimeCaches = new Map();
@@ -329,6 +334,12 @@ const isUsableAnalysis = (analysis) => {
   if (!analysis || analysis.analysisSource === 'fallback-provider') return false;
   if (String(analysis.recommendation || '').toLowerCase() === 'error') return false;
   if (Number(analysis.confidence || 0) <= 0) return false;
+  if (analysis?.meta?.accuracyValidation?.approved === false) return false;
+  if (DAILY_PICK_REQUIRE_REAL_ODDS) {
+    const oddsStatus = analysis?.bestEntry?.meta?.oddsValidation?.status;
+    const expectedValue = Number(analysis?.bestEntry?.meta?.expectedValue);
+    if (oddsStatus !== 'matched' || !Number.isFinite(expectedValue) || expectedValue < DAILY_PICK_MIN_EXPECTED_VALUE) return false;
+  }
   return true;
 };
 
@@ -350,6 +361,107 @@ const analysisExpectedValue = (analysis) => {
     ?? analysis?.meta?.decisionAudit?.candidates?.find((candidate) => candidate?.rejectionReasons?.length === 0)?.expectedValue
   );
   return Number.isFinite(value) ? value : null;
+};
+
+const buildOddsAuditReport = (analyses = []) => {
+  const entries = analyses.map((analysis) => {
+    const decisionAudit = analysis?.meta?.decisionAudit || {};
+    const selectedCandidate = decisionAudit?.candidates?.find((candidate) => (
+      candidate.market === decisionAudit.selectedMarket
+      && candidate.recommendation === decisionAudit.selectedRecommendation
+    )) || decisionAudit?.candidates?.find((candidate) => candidate?.oddsAudit);
+    const oddsAudit = analysis?.bestEntry?.meta?.oddsAudit || selectedCandidate?.oddsAudit || null;
+    return {
+      eventId: analysis?.eventId,
+      status: analysis?.analysisStatus || decisionAudit?.decision || 'unknown',
+      market: analysis?.market,
+      recommendation: analysis?.recommendation,
+      canonicalMarket: oddsAudit?.decisionMarket?.canonicalKey || null,
+      providers: oddsAudit?.providers || [],
+      selectedOdd: oddsAudit?.selected || null,
+      oddsFound: oddsAudit?.oddsFound || [],
+      oddsDiscarded: oddsAudit?.oddsDiscarded || [],
+      reason: oddsAudit?.rejectionReason || decisionAudit?.reasons?.[0] || null,
+    };
+  });
+  return {
+    matched: entries.filter((entry) => entry.status === 'approved').length,
+    waitingOdds: entries.filter((entry) => entry.status === 'waiting_odds').length,
+    rejected: entries.filter((entry) => entry.status === 'rejected').length,
+    entries,
+  };
+};
+
+const loadPredictionCalibration = async () => {
+  const rows = await all(
+    `SELECT market_family,
+            FLOOR(predicted_probability * 10) / 10 AS probability_bucket,
+            COUNT(*)::int AS sample_size,
+            SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END)::int AS wins
+     FROM analysis_predictions
+     WHERE status IN ('won', 'lost') AND settled_at >= CURRENT_TIMESTAMP - INTERVAL '365 days'
+     GROUP BY market_family, FLOOR(predicted_probability * 10) / 10`
+  ).catch((err) => {
+    console.warn('Calibracao historica indisponivel:', err.message);
+    return [];
+  });
+  return new Map(rows.map((row) => [`${row.market_family}:${Number(row.probability_bucket).toFixed(1)}`, row]));
+};
+
+const applyHistoricalCalibration = (analysis, calibration) => {
+  if (!analysis || Number(analysis.confidence || 0) <= 0) return analysis;
+  const family = analysisMarketFamily(analysis);
+  const predictedProbability = Number(analysis.confidence || 0) / 100;
+  const bucket = Math.floor(predictedProbability * 10) / 10;
+  const history = calibration.get(`${family}:${bucket.toFixed(1)}`);
+  const sampleSize = Number(history?.sample_size || 0);
+  const odd = Number(analysis?.bestEntry?.meta?.decimal_odds);
+  const fairRaw = Number(analysis?.bestEntry?.meta?.fairImpliedProbability);
+
+  if (sampleSize < ANALYSIS_CALIBRATION_MIN_SAMPLE) {
+    return {
+      ...analysis,
+      meta: {
+        ...(analysis.meta || {}),
+        calibration: { status: 'collecting', sampleSize, requiredSample: ANALYSIS_CALIBRATION_MIN_SAMPLE, family, bucket },
+      },
+    };
+  }
+
+  const empiricalRate = Number(history.wins || 0) / sampleSize;
+  const priorStrength = 20;
+  const calibratedProbability = ((empiricalRate * sampleSize) + (predictedProbability * priorStrength)) / (sampleSize + priorStrength);
+  const expectedValue = Number.isFinite(odd) && odd > 1 ? Number(((calibratedProbability * odd) - 1).toFixed(4)) : null;
+  const fairProbability = Number.isFinite(fairRaw) ? (fairRaw > 1 ? fairRaw / 100 : fairRaw) : null;
+  const probabilityEdge = fairProbability !== null ? Number((calibratedProbability - fairProbability).toFixed(4)) : null;
+  const approved = expectedValue !== null && expectedValue >= DAILY_PICK_MIN_EXPECTED_VALUE && (probabilityEdge === null || probabilityEdge >= 0.03);
+  const calibratedConfidence = Math.round(calibratedProbability * 100);
+  const bestEntry = analysis.bestEntry ? {
+    ...analysis.bestEntry,
+    confidence: calibratedConfidence,
+    meta: {
+      ...(analysis.bestEntry.meta || {}),
+      uncalibratedProbability: predictedProbability,
+      calibratedProbability,
+      expectedValue,
+      probabilityEdge,
+    },
+  } : analysis.bestEntry;
+
+  return {
+    ...analysis,
+    confidence: approved ? calibratedConfidence : 0,
+    bestEntry,
+    recommendations: Array.isArray(analysis.recommendations) && bestEntry ? [bestEntry] : analysis.recommendations,
+    meta: {
+      ...(analysis.meta || {}),
+      calibration: { status: 'applied', sampleSize, empiricalRate, predictedProbability, calibratedProbability, family, bucket },
+      accuracyValidation: {
+        approved,
+        reason: approved ? null : 'A calibracao historica reduziu EV ou vantagem abaixo do minimo.',
+      },
+    },
+  };
 };
 
 const comparePublishedAnalyses = (left, right) => {
@@ -532,6 +644,10 @@ const normalizeEntry = (entry, events = []) => {
     awayTeamImageUrl: getTeamImageUrl(matchedEvent?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
     tournamentName: sanitizeProviderText(matchedEvent?.tournament?.name || entry.tournamentName, ''),
     startTimestamp: matchedEvent?.startTimestamp || entry.startTimestamp || null,
+    round: matchedEvent?.round ?? matchedEvent?.roundInfo?.round ?? entry.round ?? null,
+    venue: matchedEvent?.venue?.name && !/^unknown$/i.test(String(matchedEvent.venue.name))
+      ? matchedEvent.venue
+      : entry.venue || null,
     status: matchedEvent?.status || entry.status || null,
     liveMinute,
     matchMode: ['inprogress', 'live'].includes(statusType) ? 'live' : 'prelive',
@@ -1014,7 +1130,7 @@ const analyzeDailyEvents = async (events = []) => {
 
       try {
         const analysisRes = await scraperGet(
-          `/analysis/${event.id}?includeOdds=false&useOddsFallback=false&wait=true&useLLM=true&useLLMExplanation=true&explainRejected=true`,
+          `/analysis/${event.id}?includeOdds=true&useOddsFallback=false&requireRealOdds=${DAILY_PICK_REQUIRE_REAL_ODDS}&minimumExpectedValue=${DAILY_PICK_MIN_EXPECTED_VALUE}&wait=true&useLLM=true&useLLMExplanation=true&explainRejected=true`,
           { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
         );
         const analysisPayload = await waitForAnalysisJob(analysisRes.data);
@@ -1159,8 +1275,11 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
       useLLM: 'true',
       useLLMExplanation: 'true',
       explainRejected: 'true',
-      includeOdds: 'false',
+      includeOdds: 'true',
       useOddsFallback: 'false',
+      requireRealOdds: String(DAILY_PICK_REQUIRE_REAL_ODDS),
+      minimumExpectedValue: String(DAILY_PICK_MIN_EXPECTED_VALUE),
+      includeEnrichment: 'true',
       fullDailyCacheTtlMs: '0',
     });
     const fullDailyRes = await scraperGet(`/analysis/full-daily?${params}`, {
@@ -1191,12 +1310,15 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
       throw new Error('Triagem diaria nao selecionou partidas elegiveis para publicacao.');
     }
 
-    let analyses = fullDaily.analyses.filter((analysis) => selectedIds.includes(String(analysis.eventId)));
+    const calibration = await loadPredictionCalibration();
+    let analyses = fullDaily.analyses
+      .filter((analysis) => selectedIds.includes(String(analysis.eventId)))
+      .map((analysis) => applyHistoricalCalibration(analysis, calibration));
     let analysisRetried = false;
     if (analyses.length === 0) {
       analysisRetried = true;
       console.warn('Triagem concluida sem analises; repetindo somente as partidas selecionadas por qualidade.');
-      analyses = await analyzeDailyEvents(selectedEvents);
+      analyses = (await analyzeDailyEvents(selectedEvents)).map((analysis) => applyHistoricalCalibration(analysis, calibration));
     }
     let publishableAnalyses = analyses
       .filter(isPublishableAnalysis)
@@ -1204,7 +1326,7 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
     if (publishableAnalyses.length === 0 && !analysisRetried) {
       analysisRetried = true;
       console.warn('Triagem retornou analises sem conteudo publicavel; repetindo somente as partidas selecionadas por qualidade.');
-      analyses = await analyzeDailyEvents(selectedEvents);
+      analyses = (await analyzeDailyEvents(selectedEvents)).map((analysis) => applyHistoricalCalibration(analysis, calibration));
       publishableAnalyses = analyses
         .filter(isPublishableAnalysis)
         .sort(comparePublishedAnalyses);
@@ -1230,6 +1352,10 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
         analysesPublished: publishableAnalyses.length,
         approvedEntries: approvedAnalyses.length,
         analysisRetried,
+        policyVersion: DAILY_PICK_POLICY_VERSION,
+        requireRealOdds: DAILY_PICK_REQUIRE_REAL_ODDS,
+        minimumExpectedValue: DAILY_PICK_MIN_EXPECTED_VALUE,
+        oddsAudit: buildOddsAuditReport(publishableAnalyses),
         championshipPriority: fullDaily.prioritySummary || null,
         warning: analysisRetried
           ? `A triagem selecionou ${selectedEvents.length} partida(s) com os melhores dados disponiveis e concluiu a analise em uma nova tentativa.`
@@ -1242,7 +1368,9 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
       ? await enrichEventsWithOdds(eligibleEvents)
       : eligibleEvents;
     const selectedEvents = rankedEvents.slice(0, PREMIUM_ENTRY_LIMIT);
-    const analyses = await analyzeDailyEvents(selectedEvents);
+    const calibration = await loadPredictionCalibration();
+    const analyses = (await analyzeDailyEvents(selectedEvents))
+      .map((analysis) => applyHistoricalCalibration(analysis, calibration));
     const publishableAnalyses = analyses
       .filter(isPublishableAnalysis)
       .sort(comparePublishedAnalyses);
@@ -1260,6 +1388,10 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
       selection: {
         strategy: 'compatible-fallback',
         analysisDate,
+        policyVersion: DAILY_PICK_POLICY_VERSION,
+        requireRealOdds: DAILY_PICK_REQUIRE_REAL_ODDS,
+        minimumExpectedValue: DAILY_PICK_MIN_EXPECTED_VALUE,
+        oddsAudit: buildOddsAuditReport(publishableAnalyses),
         error: err.message,
       },
     };
@@ -1341,6 +1473,151 @@ const persistLegacyDailyPickCache = async (data, mode = 'prelive') => {
   }
 };
 
+const persistAnalysisPredictions = async (data, mode = 'prelive') => {
+  const analyses = Array.isArray(data?.analysisResult?.analyses) ? data.analysisResult.analyses : [];
+  const eventById = new Map((data?.selectedEvents || []).map((event) => [String(event?.id), event]));
+
+  for (const analysis of analyses.filter(isUsableAnalysis)) {
+    const event = eventById.get(String(analysis.eventId)) || {};
+    const audit = analysis?.meta?.decisionAudit;
+    const selectedAudit = audit?.candidates?.find((candidate) => (
+      candidate.market === analysis.market && candidate.recommendation === analysis.recommendation
+    ));
+    const entryMeta = analysis?.bestEntry?.meta || {};
+    const timestamp = Number(analysis.startTimestamp || event.startTimestamp || event.startTime || 0);
+    const kickoffAt = timestamp > 0 ? new Date(timestamp * 1000) : null;
+    const auditedProbability = Number(selectedAudit?.objectiveConfidence) / 100;
+    const predictedProbability = Number(entryMeta.uncalibratedProbability ?? (Number.isFinite(auditedProbability) ? auditedProbability : analysis.confidence / 100));
+    const calibratedProbability = Number(entryMeta.calibratedProbability ?? (analysis.confidence / 100));
+    if (!Number.isFinite(predictedProbability) || !Number.isFinite(calibratedProbability)) continue;
+    const odd = Number(entryMeta.decimal_odds);
+    const fairRaw = Number(entryMeta.fairImpliedProbability);
+    const fairProbability = Number.isFinite(fairRaw) ? (fairRaw > 1 ? fairRaw / 100 : fairRaw) : null;
+    const finiteOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+
+    await run(
+      `INSERT INTO analysis_predictions
+       (publication_date, match_mode, provider, cache_version, event_id, kickoff_at,
+        home_team, away_team, tournament_name, market_family, market, recommendation,
+        predicted_probability, calibrated_probability, decimal_odds, fair_implied_probability,
+        expected_value, probability_edge, data_quality, market_evidence, championship_tier, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb)
+       ON CONFLICT (publication_date, match_mode, provider, cache_version, event_id, market, recommendation)
+       DO UPDATE SET
+         calibrated_probability = EXCLUDED.calibrated_probability,
+         decimal_odds = EXCLUDED.decimal_odds,
+         fair_implied_probability = EXCLUDED.fair_implied_probability,
+         expected_value = EXCLUDED.expected_value,
+         probability_edge = EXCLUDED.probability_edge,
+         data_quality = EXCLUDED.data_quality,
+         market_evidence = EXCLUDED.market_evidence,
+         payload = EXCLUDED.payload,
+         updated_at = CURRENT_TIMESTAMP`,
+      [
+        data?.selection?.analysisDate || getLocalDateKey(), normalizeMatchMode(mode), getDailyPickProvider(), DAILY_PICK_CACHE_VERSION,
+        String(analysis.eventId), kickoffAt,
+        analysis?.homeTeam?.name || event?.homeTeam?.name || null,
+        analysis?.awayTeam?.name || event?.awayTeam?.name || null,
+        analysis?.tournamentName || event?.tournament?.name || null,
+        analysisMarketFamily(analysis), analysis.market, analysis.recommendation,
+        predictedProbability, calibratedProbability, Number.isFinite(odd) ? odd : null, fairProbability,
+        finiteOrNull(entryMeta.expectedValue ?? selectedAudit?.expectedValue),
+        finiteOrNull(entryMeta.probabilityEdge ?? selectedAudit?.probabilityEdge),
+        finiteOrNull(entryMeta.dataQuality ?? selectedAudit?.dataQuality),
+        finiteOrNull(entryMeta.marketEvidence ?? selectedAudit?.marketEvidence),
+        Number(analysis?.championshipPriority?.tier || event?.championshipPriority?.tier) || null,
+        JSON.stringify(analysis),
+      ]
+    );
+  }
+};
+
+const settlePendingAnalysisPredictions = async (limit = 50) => {
+  const pending = await all(
+    `SELECT * FROM analysis_predictions
+     WHERE status = 'pending' AND (kickoff_at IS NULL OR kickoff_at < CURRENT_TIMESTAMP - INTERVAL '90 minutes')
+     ORDER BY kickoff_at ASC NULLS LAST LIMIT ?`,
+    [Math.max(1, Math.min(200, Number(limit) || 50))]
+  );
+  const summary = { checked: pending.length, settled: 0, pending: 0, failed: 0 };
+
+  for (const prediction of pending) {
+    try {
+      const eventRes = await scraperGet(`/event/${prediction.event_id}`, { timeout: 30000 });
+      const event = eventRes.data?.data || eventRes.data?.event || eventRes.data;
+      const status = String(event?.status?.type || event?.status?.description || '').toLowerCase();
+      if (!/finished|ended|final|afterextra|afterpenalties/.test(status)) {
+        summary.pending += 1;
+        continue;
+      }
+
+      let statistics = null;
+      if (['corners', 'cards'].includes(prediction.market_family)) {
+        statistics = await scraperGet(`/event/${prediction.event_id}/statistics`, { timeout: 30000 })
+          .then((response) => response.data)
+          .catch(() => null);
+      }
+      const outcome = settlePredictionOutcome(prediction, event, statistics);
+      if (!outcome) {
+        summary.pending += 1;
+        continue;
+      }
+
+      const closingOddsData = await fetchEventOdds(prediction.event_id);
+      const closingEntry = closingOddsData ? enrichEntryWithOdds({
+        market: prediction.market,
+        recommendation: prediction.recommendation,
+        meta: {},
+      }, closingOddsData) : null;
+      const closingOdd = Number(closingEntry?.meta?.decimal_odds);
+      const publishedOdd = Number(prediction.decimal_odds);
+      const closingLineValue = Number.isFinite(closingOdd) && closingOdd > 1 && Number.isFinite(publishedOdd) && publishedOdd > 1
+        ? Number(((publishedOdd / closingOdd) - 1).toFixed(4))
+        : null;
+      const homeScore = Number(event?.homeScore?.current ?? event?.score?.home ?? event?.homeScore);
+      const awayScore = Number(event?.awayScore?.current ?? event?.score?.away ?? event?.awayScore);
+
+      await run(
+        `UPDATE analysis_predictions
+         SET status = ?, home_score = ?, away_score = ?, closing_odds = ?, closing_line_value = ?,
+             settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'pending'`,
+        [outcome, homeScore, awayScore, Number.isFinite(closingOdd) ? closingOdd : null, closingLineValue, prediction.id]
+      );
+      summary.settled += 1;
+    } catch (err) {
+      summary.failed += 1;
+      console.warn(`Falha ao liquidar previsao ${prediction.id}:`, err.message);
+    }
+  }
+
+  return summary;
+};
+
+const getAnalysisPerformanceMetrics = async () => {
+  const totals = await get(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+            COUNT(*) FILTER (WHERE status = 'won')::int AS won,
+            COUNT(*) FILTER (WHERE status = 'lost')::int AS lost,
+            COUNT(*) FILTER (WHERE status = 'void')::int AS void,
+            AVG(CASE WHEN status IN ('won','lost') THEN CASE WHEN status = 'won' THEN 1.0 ELSE 0.0 END END) AS hit_rate,
+            AVG(CASE WHEN status = 'won' THEN decimal_odds - 1 WHEN status = 'lost' THEN -1.0 END) AS roi_per_unit,
+            AVG(closing_line_value) FILTER (WHERE closing_line_value IS NOT NULL) AS average_clv
+     FROM analysis_predictions`
+  );
+  const byMarket = await all(
+    `SELECT market_family, COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS resolved,
+            AVG(CASE WHEN status IN ('won','lost') THEN CASE WHEN status = 'won' THEN 1.0 ELSE 0.0 END END) AS hit_rate,
+            AVG(CASE WHEN status = 'won' THEN decimal_odds - 1 WHEN status = 'lost' THEN -1.0 END) AS roi_per_unit,
+            AVG(POWER(CASE WHEN status = 'won' THEN 1.0 ELSE 0.0 END - COALESCE(calibrated_probability, predicted_probability), 2))
+              FILTER (WHERE status IN ('won','lost')) AS brier_score
+     FROM analysis_predictions GROUP BY market_family ORDER BY market_family`
+  );
+  return { totals, byMarket, calibrationMinimumSample: ANALYSIS_CALIBRATION_MIN_SAMPLE };
+};
+
 const claimDailyPickGeneration = async (mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode);
   const token = crypto.randomUUID();
@@ -1385,6 +1662,9 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
     [payload, claim.id, claim.token]
   );
   await persistLegacyDailyPickCache(data, matchMode);
+  await persistAnalysisPredictions(data, matchMode).catch((err) => {
+    console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
+  });
   const runtimeCache = {
     cacheKey: getDailyPickCacheKey(matchMode),
     data,
@@ -1418,6 +1698,9 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
   );
 
   await persistLegacyDailyPickCache(data, matchMode);
+  await persistAnalysisPredictions(data, matchMode).catch((err) => {
+    console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
+  });
 
   const runtimeCache = {
     cacheKey: getDailyPickCacheKey(matchMode),
@@ -1433,6 +1716,9 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
 
 const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false } = {}) => {
   const matchMode = normalizeMatchMode(mode);
+  await settlePendingAnalysisPredictions().catch((err) => {
+    console.warn('Liquidacao automatica de previsoes ignorada:', err.message);
+  });
   if (!force) {
     const published = await readPublishedDailyPick(matchMode);
     if (published?.data && hasDailyPickEvents(published)) {
@@ -1507,7 +1793,10 @@ const hasAiAnalysis = (cache) => {
   return selectPublishedAnalyses(cache.data.analysisResult, selectedEvents, PREMIUM_ENTRY_LIMIT).length > 0;
 };
 
-const hasDailyPickEvents = (cache) => filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode).length > 0;
+const hasDailyPickEvents = (cache) => (
+  cache?.data?.selection?.policyVersion === DAILY_PICK_POLICY_VERSION
+  && filterEventsForMode(cache?.data?.selectedEvents || [], cache?.data?.matchMode).length > 0
+);
 
 const ensureDailyPick = async ({ requireAnalysis = false, mode = 'prelive' } = {}) => {
   const matchMode = normalizeMatchMode(mode);
@@ -1998,8 +2287,10 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
 const analysisQueryParams = (query = {}) => {
   const params = new URLSearchParams({
-    includeOdds: 'false',
+    includeOdds: 'true',
     useOddsFallback: 'false',
+    requireRealOdds: String(DAILY_PICK_REQUIRE_REAL_ODDS),
+    minimumExpectedValue: String(DAILY_PICK_MIN_EXPECTED_VALUE),
   });
   const allowed = [
     'date',
@@ -2024,6 +2315,8 @@ const analysisQueryParams = (query = {}) => {
     'useLLMExplanation',
     'explainRejected',
     'includeEnrichment',
+    'requireRealOdds',
+    'minimumExpectedValue',
     'wait',
   ];
 
@@ -2102,6 +2395,10 @@ const toAnalysisCenterEntry = (entry, events = []) => {
     awayTeamName: awayTeam.name,
     tournamentName: sanitizeProviderText(event?.tournament?.name || entry.tournamentName, ''),
     startTimestamp: event?.startTimestamp || entry.startTimestamp || null,
+    round: event?.round ?? event?.roundInfo?.round ?? entry.round ?? null,
+    venue: event?.venue?.name && !/^unknown$/i.test(String(event.venue.name))
+      ? event.venue
+      : entry.venue || null,
     status: event?.status || entry.status || null,
     rationale,
     matchAnalysis: entry.matchAnalysis || rationale,
@@ -2195,6 +2492,25 @@ app.get('/api/analysis/events/:eventIds', authenticateToken, requirePremium, asy
   }
 
   return proxyAnalysis(req, res, `/analysis/${eventIds.join(',')}`);
+});
+
+app.post('/api/internal/analysis-predictions/settle', requireInternalDailyPickSecret, async (req, res) => {
+  try {
+    const result = await settlePendingAnalysisPredictions(req.body?.limit);
+    res.json({ success: true, result });
+  } catch (err) {
+    console.error('Erro ao liquidar previsoes:', err.message);
+    res.status(500).json({ error: err.message || 'Erro ao liquidar previsoes.' });
+  }
+});
+
+app.get('/api/internal/analysis-predictions/metrics', requireInternalDailyPickSecret, async (_req, res) => {
+  try {
+    res.json({ success: true, result: await getAnalysisPerformanceMetrics() });
+  } catch (err) {
+    console.error('Erro ao calcular metricas das previsoes:', err.message);
+    res.status(500).json({ error: err.message || 'Erro ao calcular metricas.' });
+  }
 });
 
 app.get('/api/analysis/by-teams', authenticateToken, requirePremium, async (req, res) => {
