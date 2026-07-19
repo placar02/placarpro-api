@@ -41,6 +41,7 @@ for (const [path, table, validator] of [['entries', 'entries', 'entry'], ['news'
 }
 
 router.get('/audit-logs', controller.auditLogs);
+router.get('/odds-snapshots', controller.oddsSnapshots);
 router.use((error, _req, res, _next) => {
   console.error('Erro administrativo:', error);
   if (error.code === '23505') return res.status(409).json({ error: 'Ja existe um registro com esses dados.' });

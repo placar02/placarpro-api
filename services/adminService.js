@@ -198,4 +198,24 @@ async function listAuditLogs(query = {}) {
   return { data: rows.rows, pagination: { page, limit, total: count.rows[0].total, pages: Math.ceil(count.rows[0].total / limit) } };
 }
 
-module.exports = { dashboard, listUsers, getUser, updateUser, deleteUser, listResource, saveResource, deleteResource, getSettings, updateSettings, getPaymentSettings, updatePaymentSettings, listAuditLogs };
+async function listOddsSnapshots(query = {}) {
+  const { page, limit } = pageMeta(query);
+  const params = [];
+  const where = [];
+  if (query.event_id) { params.push(String(query.event_id)); where.push(`o.event_id = $${params.length}`); }
+  if (query.provider) { params.push(String(query.provider)); where.push(`o.provider = $${params.length}`); }
+  if (query.bookmaker) { params.push(`%${String(query.bookmaker)}%`); where.push(`o.bookmaker ILIKE $${params.length}`); }
+  if (query.market) { params.push(`%${String(query.market)}%`); where.push(`(o.canonical_market ILIKE $${params.length} OR o.original_market ILIKE $${params.length})`); }
+  if (query.date) { params.push(String(query.date)); where.push(`o.publication_date = $${params.length}::date`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await pool.query(`SELECT COUNT(*)::int total FROM bookmaker_odds_snapshots o ${clause}`, params);
+  params.push(limit, (page - 1) * limit);
+  const rows = await pool.query(
+    `SELECT o.* FROM bookmaker_odds_snapshots o ${clause}
+     ORDER BY o.captured_at DESC, o.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  return { data: rows.rows, pagination: { page, limit, total: count.rows[0].total, pages: Math.ceil(count.rows[0].total / limit) } };
+}
+
+module.exports = { dashboard, listUsers, getUser, updateUser, deleteUser, listResource, saveResource, deleteResource, getSettings, updateSettings, getPaymentSettings, updatePaymentSettings, listAuditLogs, listOddsSnapshots };

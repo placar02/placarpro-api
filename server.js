@@ -1535,6 +1535,62 @@ const persistAnalysisPredictions = async (data, mode = 'prelive') => {
   }
 };
 
+const persistBookmakerOddsSnapshots = async (data) => {
+  const analyses = Array.isArray(data?.analysisResult?.analyses) ? data.analysisResult.analyses : [];
+  const publicationDate = data?.selection?.analysisDate || getLocalDateKey();
+  const persisted = new Set();
+
+  for (const analysis of analyses) {
+    const entries = [analysis?.bestEntry, ...(Array.isArray(analysis?.recommendations) ? analysis.recommendations : [])].filter(Boolean);
+    for (const entry of entries) {
+      const audit = entry?.meta?.oddsAudit;
+      const candidates = Array.isArray(audit?.oddsFound) ? audit.oddsFound : [];
+      for (const candidate of candidates) {
+        const decimalOdd = Number(candidate?.decimalOdd);
+        if (!Number.isFinite(decimalOdd) || decimalOdd <= 1 || !candidate?.normalizedMarket) continue;
+        const capturedAt = candidate?.capturedAt && Number.isFinite(Date.parse(candidate.capturedAt))
+          ? new Date(candidate.capturedAt)
+          : new Date();
+        const identity = [
+          analysis.eventId,
+          candidate.source,
+          candidate.bookmaker,
+          candidate.normalizedMarket,
+          candidate.originalChoice,
+          candidate.line,
+          decimalOdd,
+          capturedAt.toISOString(),
+        ].join('|');
+        const snapshotKey = crypto.createHash('sha256').update(identity).digest('hex');
+        if (persisted.has(snapshotKey)) continue;
+        persisted.add(snapshotKey);
+
+        await run(
+          `INSERT INTO bookmaker_odds_snapshots
+           (snapshot_key, publication_date, event_id, provider, bookmaker, canonical_market,
+            original_market, original_choice, line, decimal_odd, captured_at, status, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?::jsonb)
+           ON CONFLICT (snapshot_key) DO NOTHING`,
+          [
+            snapshotKey,
+            publicationDate,
+            String(analysis.eventId),
+            String(candidate.source || 'unknown'),
+            candidate.bookmaker || null,
+            String(candidate.normalizedMarket),
+            candidate.originalMarket || null,
+            candidate.originalChoice || null,
+            Number.isFinite(Number(candidate.line)) ? Number(candidate.line) : null,
+            decimalOdd,
+            capturedAt,
+            JSON.stringify({ matchStage: candidate.matchStage, compatibility: candidate.compatibility }),
+          ]
+        );
+      }
+    }
+  }
+};
+
 const settlePendingAnalysisPredictions = async (limit = 50) => {
   const pending = await all(
     `SELECT * FROM analysis_predictions
@@ -1669,6 +1725,9 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
   });
+  await persistBookmakerOddsSnapshots(data).catch((err) => {
+    console.warn('Nao foi possivel registrar snapshots de odds:', err.message);
+  });
   const runtimeCache = {
     cacheKey: getDailyPickCacheKey(matchMode),
     data,
@@ -1705,6 +1764,9 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
   await persistLegacyDailyPickCache(data, matchMode);
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
+  });
+  await persistBookmakerOddsSnapshots(data).catch((err) => {
+    console.warn('Nao foi possivel registrar snapshots de odds:', err.message);
   });
 
   const runtimeCache = {
@@ -1944,10 +2006,13 @@ const startDailyPickScheduler = () => {
 
 app.get('/api/health', async (_req, res) => {
   try {
-    const [database, worker, publication] = await Promise.all([
+    const [database, worker, publication, realOdds] = await Promise.all([
       get('SELECT CURRENT_TIMESTAMP AS now'),
       get("SELECT worker_name, status, last_seen_at FROM worker_heartbeats WHERE worker_name = 'daily-pick-publisher'"),
       get("SELECT analysis_date, status, updated_at FROM daily_analysis_publications WHERE match_mode = 'prelive' ORDER BY updated_at DESC LIMIT 1"),
+      get(`SELECT COUNT(*) FILTER (WHERE captured_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours')::int AS snapshots_24h,
+                  MAX(captured_at) AS last_captured_at
+           FROM bookmaker_odds_snapshots`),
     ]);
     const workerAgeHours = worker?.last_seen_at
       ? (Date.now() - new Date(worker.last_seen_at).getTime()) / (60 * 60 * 1000)
@@ -1959,6 +2024,7 @@ app.get('/api/health', async (_req, res) => {
       database: { ok: Boolean(database) },
       dailyPickWorker: worker ? { ...worker, healthy: workerHealthy, ageHours: Number(workerAgeHours.toFixed(2)) } : { healthy: false, status: 'never_seen' },
       latestPublication: publication || null,
+      realOdds: realOdds || { snapshots_24h: 0, last_captured_at: null },
     });
   } catch (error) {
     res.status(503).json({ ok: false, database: { ok: false }, error: 'Health check indisponivel.' });

@@ -84,5 +84,6 @@ const updatePayments = safe(async (req, res) => {
   res.json(after);
 });
 const auditLogs = safe(async (req, res) => res.json(await service.listAuditLogs(req.query)));
+const oddsSnapshots = safe(async (req, res) => res.json(await service.listOddsSnapshots(req.query)));
 
-module.exports = { dashboard, users, user, updateUser, deleteUser, changePassword, resource, settings, updateSettings, payments, updatePayments, auditLogs };
+module.exports = { dashboard, users, user, updateUser, deleteUser, changePassword, resource, settings, updateSettings, payments, updatePayments, auditLogs, oddsSnapshots };
