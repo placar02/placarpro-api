@@ -9,7 +9,11 @@
     "daily-pick:publish": "node scripts/publish-daily-pick.js",
     "analysis:settle": "node scripts/settle-analysis-predictions.js",
     "analysis:metrics": "node scripts/analysis-metrics.js",
-    "check": "node --check server.js && node --check db.js && node --check controllers/adminController.js && node --check services/adminService.js",
+    "analysis:backtest": "node scripts/analysis-backtest.js",
+    "analysis:operations": "node scripts/analysis-operations.js",
+    "analysis:weights": "node scripts/analysis-weight-recommendations.js",
+    "load:test": "node scripts/load-test.js",
+    "check": "node --check server.js && node --check db.js && node --check controllers/adminController.js && node --check services/adminService.js && node --check services/analysisOperations.js && node --check services/analysisDate.js",
     "build": "npm run check",
     "test": "node --test tests/*.test.js && npm run check"
   },

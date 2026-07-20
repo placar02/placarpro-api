@@ -9,5 +9,12 @@ foreach ($processId in $processIds) {
   Stop-Process -Id $processId -Force
 }
 
-Write-Host "Iniciando API na porta $port..."
+# O processo local atua como worker/publicador. Estas variaveis valem somente
+# para esta execucao e nao alteram a configuracao segura usada no Render.
+$env:NODE_ENV = "development"
+$env:DAILY_PICK_READ_ONLY = "false"
+$env:DAILY_PICK_PUBLISHER_ENABLED = "true"
+$env:DAILY_PICK_SCHEDULER_ENABLED = "false"
+
+Write-Host "Iniciando API publicadora local na porta $port..."
 node server.js

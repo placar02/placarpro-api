@@ -1,9 +1,31 @@
 require('dotenv').config();
+const { validateAnalysisDate } = require('../services/analysisDate');
 
 const DEFAULT_BASE_URL = `http://localhost:${process.env.PORT || 3000}`;
 
-const args = new Set(process.argv.slice(2));
-const force = args.has('--force');
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+const npmDateArgument = String(process.env.npm_config_date || '').trim();
+const npmForceArgument = String(process.env.npm_config_force || '').trim().toLowerCase();
+const force = args.has('--force') || ['1', 'true', 'yes'].includes(npmForceArgument);
+const inlineDateArgument = argv.find((arg) => arg.startsWith('--date='));
+const dateFlagIndex = argv.indexOf('--date');
+const dateArgument = inlineDateArgument !== undefined
+  ? inlineDateArgument.slice('--date='.length)
+  : dateFlagIndex >= 0 ? argv[dateFlagIndex + 1] : npmDateArgument || null;
+let requestedDate = null;
+if ((inlineDateArgument !== undefined || dateFlagIndex >= 0 || npmDateArgument) && (!dateArgument || dateArgument.startsWith('--'))) {
+  console.error('Informe a data apos --date usando o formato YYYY-MM-DD.');
+  process.exit(1);
+}
+if (dateArgument) {
+  try {
+    requestedDate = validateAnalysisDate(dateArgument);
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}
 const baseUrl = String(process.env.DAILY_PICK_PUBLISH_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
 const heartbeatUrl = String(process.env.DAILY_PICK_HEARTBEAT_URL || baseUrl).replace(/\/+$/, '');
 const secret = String(process.env.DAILY_PICK_PUBLISH_SECRET || '').trim();
@@ -18,14 +40,15 @@ if (!secret) {
 }
 
 async function main() {
-  await sendHeartbeat('starting');
+  console.log(`Publicacao solicitada: data=${requestedDate || 'automatica'}, destino=${baseUrl}, force=${force}`);
+  await sendHeartbeat('starting', { requestedDate });
   const response = await fetch(`${baseUrl}/api/internal/daily-pick/publish${force ? '?force=true' : ''}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-daily-pick-secret': secret,
     },
-    body: JSON.stringify({ modes, force }),
+    body: JSON.stringify({ modes, force, date: requestedDate }),
   });
 
   const text = await response.text();

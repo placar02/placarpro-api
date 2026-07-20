@@ -18,6 +18,8 @@ const {
   setSessionCookie,
 } = require('./middlewares/auth');
 const { analysisMarketFamily, settlePredictionOutcome } = require('./services/analysisAccuracy');
+const { buildBacktestReport, buildOddsProviderReliability, buildWeightRecommendations, evaluateOperationalAlerts } = require('./services/analysisOperations');
+const { validateManualPublicationDate } = require('./services/analysisDate');
 const { assertDailyPickPublication } = require('./services/dailyPickContract');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
@@ -56,6 +58,10 @@ const DAILY_PICK_REQUIRE_REAL_ODDS = process.env.DAILY_PICK_REQUIRE_REAL_ODDS !=
 const DAILY_PICK_MIN_EXPECTED_VALUE = Math.max(0, Number(process.env.DAILY_PICK_MIN_EXPECTED_VALUE || 0.05));
 const DAILY_PICK_POLICY_VERSION = process.env.DAILY_PICK_POLICY_VERSION || 'accuracy-v1';
 const ANALYSIS_CALIBRATION_MIN_SAMPLE = Math.max(10, Number(process.env.ANALYSIS_CALIBRATION_MIN_SAMPLE || 30));
+const ANALYSIS_WEIGHT_MIN_SAMPLE = Math.max(30, Number(process.env.ANALYSIS_WEIGHT_MIN_SAMPLE || 100));
+const ANALYSIS_MONITOR_ENABLED = process.env.ANALYSIS_MONITOR_ENABLED !== 'false';
+const ANALYSIS_MONITOR_INTERVAL_MS = Math.max(60000, Number(process.env.ANALYSIS_MONITOR_INTERVAL_MS || 5 * 60 * 1000));
+const DAILY_PICK_MANUAL_MAX_DAYS_AHEAD = Math.max(0, Number(process.env.DAILY_PICK_MANUAL_MAX_DAYS_AHEAD || 14));
 
 const dailyPickRefreshPromises = new Map();
 const dailyPickRuntimeCaches = new Map();
@@ -599,6 +605,9 @@ const filterEligibleDailyEvents = (events = []) => deduplicateEventsByFixture(ev
 
 const filterUpcomingEvents = (events = []) => deduplicateEventsByFixture(events.filter(isUpcomingEvent))
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
+
+const filterUpcomingEventsForDate = (events = [], date) => filterUpcomingEvents(events)
+  .filter((event) => getEventDateKey(event) === date);
 
 const normalizeMatchMode = (value) => String(value || '').toLowerCase() === 'live' ? 'live' : 'prelive';
 
@@ -1167,9 +1176,10 @@ const analyzeDailyEvents = async (events = []) => {
   return analyses.filter(Boolean);
 };
 
-const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) => {
+const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000, requestedDate = null) => {
   const matchMode = normalizeMatchMode(mode);
-  let analysisDate = getLocalDateKey();
+  const explicitDate = requestedDate || null;
+  let analysisDate = explicitDate || getLocalDateKey();
   let events = [];
   let eligibleEvents = [];
   const fetchErrors = [];
@@ -1192,8 +1202,11 @@ const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) =>
     }
   }
 
-  for (const offset of matchMode === 'live' ? [] : [0, 1, 2]) {
-    const date = getLocalDateKeyOffset(offset);
+  const candidateDates = explicitDate
+    ? [explicitDate]
+    : [0, 1, 2].map((offset) => getLocalDateKeyOffset(offset));
+
+  for (const date of matchMode === 'live' ? [] : candidateDates) {
 
     try {
       const matchesRes = await scraperGet(`/scheduled-matches?date=${date}`, { timeout: timeoutMs }); ///////////
@@ -1204,7 +1217,9 @@ const fetchDailyCandidateEvents = async (mode = 'prelive', timeoutMs = 60000) =>
       }
 
       events = matchesRes.data.data || [];
-      eligibleEvents = offset === 0 ? filterEligibleDailyEvents(events) : filterUpcomingEvents(events);
+      eligibleEvents = date === getLocalDateKey()
+        ? filterEligibleDailyEvents(events)
+        : filterUpcomingEventsForDate(events, date);
 
       if (eligibleEvents.length > 0) {
         analysisDate = date;
@@ -1258,11 +1273,11 @@ const getFastDailyPick = async (mode = 'prelive', state = null) => {
   return fastCache;
 };
 
-const fetchDailyAnalysis = async (mode = 'prelive') => {
-  const { matchMode, analysisDate, eligibleEvents } = await fetchDailyCandidateEvents(mode);
+const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
+  const { matchMode, analysisDate, eligibleEvents } = await fetchDailyCandidateEvents(mode, 60000, requestedDate);
 
   if (eligibleEvents.length === 0) {
-    return { matchMode, selectedEvents: [], analysisResult: null };
+    throw new Error(`Nenhuma partida pre-jogo elegivel foi encontrada em ${analysisDate}.`);
   }
 
   try {
@@ -1401,8 +1416,8 @@ const fetchDailyAnalysis = async (mode = 'prelive') => {
   }
 };
 
-const getDailyPickCacheKey = (mode = 'prelive') => {
-  return `daily-pick-${DAILY_PICK_CACHE_VERSION}:${normalizeMatchMode(mode)}:${process.env.SCORES_PROVIDER || '365scores'}:${getLocalDateKey()}`;
+const getDailyPickCacheKey = (mode = 'prelive', date = getLocalDateKey()) => {
+  return `daily-pick-${DAILY_PICK_CACHE_VERSION}:${normalizeMatchMode(mode)}:${process.env.SCORES_PROVIDER || '365scores'}:${date}`;
 };
 
 const getDailyPickProvider = () => process.env.SCORES_PROVIDER || '365scores';
@@ -1417,7 +1432,7 @@ const mapDailyPickPublication = (row, mode = 'prelive') => {
   if (!row) return null;
   const matchMode = normalizeMatchMode(row.match_mode || mode);
   return {
-    cacheKey: getDailyPickCacheKey(matchMode),
+    cacheKey: getDailyPickCacheKey(matchMode, row.analysis_date ? String(row.analysis_date).slice(0, 10) : getLocalDateKey()),
     data: parseDailyPickPayload(row.payload),
     updatedAt: row.generated_at
       ? new Date(row.generated_at).getTime()
@@ -1454,18 +1469,19 @@ const readPublishedDailyPickForDate = async (date, mode = 'prelive') => {
   }
 };
 
-const readDailyPickPublicationState = async (mode = 'prelive') => {
+const readDailyPickPublicationState = async (mode = 'prelive', date = getLocalDateKey()) => {
   const matchMode = normalizeMatchMode(mode);
   return get(
     `SELECT id, status, error, updated_at, generated_at FROM daily_analysis_publications
      WHERE analysis_date = ? AND match_mode = ? AND provider = ? AND cache_version = ?
      LIMIT 1`,
-    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION]
+    [date, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION]
   );
 };
 
-const persistLegacyDailyPickCache = async (data, mode = 'prelive') => {
-  const cacheKey = getDailyPickCacheKey(mode);
+const persistLegacyDailyPickCache = async (data, mode = 'prelive', storageDate = null) => {
+  const publicationDate = storageDate || data?.selection?.analysisDate || getLocalDateKey();
+  const cacheKey = getDailyPickCacheKey(mode, publicationDate);
   const payload = JSON.stringify(data);
   const existing = await get('SELECT id FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
 
@@ -1677,10 +1693,146 @@ const getAnalysisPerformanceMetrics = async () => {
   return { totals, byMarket, calibrationMinimumSample: ANALYSIS_CALIBRATION_MIN_SAMPLE };
 };
 
+const loadAnalysisBacktestRows = async (days = 365) => {
+  const safeDays = Math.max(7, Math.min(1825, Number(days) || 365));
+  const rows = await all(
+    `SELECT publication_date, kickoff_at, settled_at, tournament_name, market_family,
+            predicted_probability, calibrated_probability, decimal_odds, expected_value,
+            data_quality, market_evidence, championship_tier, status, closing_line_value
+     FROM analysis_predictions
+     WHERE published_at >= CURRENT_TIMESTAMP - (? * INTERVAL '1 day')
+     ORDER BY published_at ASC
+     LIMIT 50000`,
+    [safeDays]
+  );
+  return { rows, days: safeDays };
+};
+
+const getProfessionalBacktest = async (days = 365) => {
+  const loaded = await loadAnalysisBacktestRows(days);
+  return buildBacktestReport(loaded.rows, { days: loaded.days });
+};
+
+const persistWeightRecommendations = async (recommendations) => {
+  for (const recommendation of recommendations) {
+    await run(
+      `INSERT INTO analysis_weight_recommendations
+       (market_family, status, sample_size, evidence_multiplier, rationale, safeguards, generated_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (market_family) DO UPDATE SET
+         status = EXCLUDED.status,
+         sample_size = EXCLUDED.sample_size,
+         evidence_multiplier = EXCLUDED.evidence_multiplier,
+         rationale = EXCLUDED.rationale,
+         safeguards = EXCLUDED.safeguards,
+         generated_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP`,
+      [
+        recommendation.marketFamily,
+        recommendation.status,
+        recommendation.sampleSize,
+        recommendation.evidenceMultiplier ?? null,
+        recommendation.rationale || null,
+        JSON.stringify(recommendation.safeguards || {}),
+      ]
+    );
+  }
+};
+
+const getAnalysisWeightRecommendations = async (days = 365) => {
+  const report = await getProfessionalBacktest(days);
+  const recommendations = buildWeightRecommendations(report, ANALYSIS_WEIGHT_MIN_SAMPLE);
+  await persistWeightRecommendations(recommendations);
+  return { generatedAt: new Date().toISOString(), minimumSample: ANALYSIS_WEIGHT_MIN_SAMPLE, automaticallyApplied: false, recommendations };
+};
+
+const getAnalysisOperationalSnapshot = async () => {
+  const [worker, publication, predictions, oddsProviders, recentPredictionPayloads] = await Promise.all([
+    get(`SELECT worker_name, status, details, last_seen_at,
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_seen_at)) / 3600 AS age_hours
+         FROM worker_heartbeats WHERE worker_name = 'daily-pick-publisher'`),
+    get(`SELECT status, error, analysis_date, provider, generated_at, updated_at,
+                EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(generated_at, updated_at))) / 3600 AS age_hours
+         FROM daily_analysis_publications ORDER BY COALESCE(generated_at, updated_at) DESC LIMIT 1`),
+    get(`SELECT COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                COUNT(*) FILTER (WHERE status = 'pending' AND kickoff_at < CURRENT_TIMESTAMP - INTERVAL '6 hours')::int AS overdue,
+                COUNT(*) FILTER (WHERE status IN ('won','lost'))::int AS resolved
+         FROM analysis_predictions`),
+    all(`SELECT provider, bookmaker, COUNT(*)::int AS snapshots,
+                COUNT(DISTINCT event_id)::int AS events,
+                MAX(captured_at) AS last_captured_at
+         FROM bookmaker_odds_snapshots
+         WHERE captured_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+         GROUP BY provider, bookmaker ORDER BY events DESC, snapshots DESC`),
+    all(`SELECT payload FROM analysis_predictions WHERE published_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'`),
+  ]);
+  const odds = {
+    events24h: oddsProviders.reduce((sum, provider) => sum + Number(provider.events || 0), 0),
+    snapshots24h: oddsProviders.reduce((sum, provider) => sum + Number(provider.snapshots || 0), 0),
+    providers: oddsProviders,
+    reliability: buildOddsProviderReliability(recentPredictionPayloads),
+  };
+  const snapshot = {
+    generatedAt: new Date().toISOString(),
+    worker: worker ? { ...worker, ageHours: Number(worker.age_hours) } : null,
+    publication: publication ? { ...publication, ageHours: Number(publication.age_hours) } : null,
+    predictions,
+    odds,
+  };
+  const alerts = evaluateOperationalAlerts(snapshot, {
+    workerMaxHours: process.env.ANALYSIS_WORKER_MAX_AGE_HOURS || 30,
+    publicationMaxHours: process.env.ANALYSIS_PUBLICATION_MAX_AGE_HOURS || 30,
+    overduePredictions: process.env.ANALYSIS_OVERDUE_PREDICTIONS_ALERT || 20,
+  });
+  const fingerprints = alerts.map((alert) => alert.fingerprint);
+  for (const alert of alerts) {
+    const previousAlert = await get('SELECT status, severity FROM analysis_operational_alerts WHERE fingerprint = ?', [alert.fingerprint]);
+    await run(
+      `INSERT INTO analysis_operational_alerts
+       (fingerprint, severity, message, status, details)
+       VALUES (?, ?, ?, 'open', ?::jsonb)
+       ON CONFLICT (fingerprint) DO UPDATE SET
+         severity = EXCLUDED.severity, message = EXCLUDED.message, status = 'open',
+         details = EXCLUDED.details, occurrence_count = analysis_operational_alerts.occurrence_count + 1,
+         last_seen_at = CURRENT_TIMESTAMP, resolved_at = NULL, updated_at = CURRENT_TIMESTAMP`,
+      [alert.fingerprint, alert.severity, alert.message, JSON.stringify(alert.details || {})]
+    );
+    const alertWebhookUrl = String(process.env.ANALYSIS_ALERT_WEBHOOK_URL || '').trim();
+    if (alertWebhookUrl && (!previousAlert || previousAlert.status !== 'open' || previousAlert.severity !== alert.severity)) {
+      axios.post(alertWebhookUrl, {
+        source: 'placarpro-analysis-monitor',
+        severity: alert.severity,
+        message: alert.message,
+        fingerprint: alert.fingerprint,
+        details: alert.details || {},
+        timestamp: new Date().toISOString(),
+      }, { timeout: 5000 }).catch((error) => logger.warn('analysis_alert_webhook_failed', { fingerprint: alert.fingerprint, error: error.message }));
+    }
+  }
+  if (fingerprints.length) {
+    await run(
+      `UPDATE analysis_operational_alerts SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE status = 'open' AND NOT (fingerprint = ANY(?::text[]))`,
+      [fingerprints]
+    );
+  } else {
+    await run(`UPDATE analysis_operational_alerts SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE status = 'open'`);
+  }
+  return { ...snapshot, status: alerts.some((alert) => alert.severity === 'critical') ? 'critical' : alerts.length ? 'degraded' : 'healthy', alerts };
+};
+
+const startAnalysisOperationsMonitor = () => {
+  if (!ANALYSIS_MONITOR_ENABLED) return;
+  const inspect = () => getAnalysisOperationalSnapshot().catch((error) => logger.error('analysis_monitor_failed', { error: error.message }));
+  setTimeout(inspect, 5000).unref();
+  setInterval(inspect, ANALYSIS_MONITOR_INTERVAL_MS).unref();
+};
+
 const claimDailyPickGeneration = async (mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode);
   const token = crypto.randomUUID();
-  const params = [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, token];
+  const generationDate = getLocalDateKey();
+  const params = [generationDate, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, token];
 
   try {
     const inserted = await get(
@@ -1691,7 +1843,7 @@ const claimDailyPickGeneration = async (mode = 'prelive') => {
        RETURNING id`,
       params
     );
-    if (inserted?.id) return { id: inserted.id, token };
+    if (inserted?.id) return { id: inserted.id, token, date: generationDate };
   } catch (err) {
     console.error('Erro ao iniciar publicacao diaria de analise:', err.message);
     return null;
@@ -1705,14 +1857,15 @@ const claimDailyPickGeneration = async (mode = 'prelive') => {
        AND status <> 'published'
        AND (status <> 'generating' OR updated_at < ?)
      RETURNING id`,
-    [token, getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, staleBefore]
+    [token, generationDate, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, staleBefore]
   );
 
-  return updated?.id ? { id: updated.id, token } : null;
+  return updated?.id ? { id: updated.id, token, date: generationDate } : null;
 };
 
 const publishDailyPick = async (claim, data, mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  const publicationDate = claim?.date || getLocalDateKey();
   assertDailyPickPublication(data);
   const payload = JSON.stringify(data);
   await run(
@@ -1721,7 +1874,7 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
      WHERE id = ? AND generation_token = ?`,
     [payload, claim.id, claim.token]
   );
-  await persistLegacyDailyPickCache(data, matchMode);
+  await persistLegacyDailyPickCache(data, matchMode, publicationDate);
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
   });
@@ -1729,20 +1882,21 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
     console.warn('Nao foi possivel registrar snapshots de odds:', err.message);
   });
   const runtimeCache = {
-    cacheKey: getDailyPickCacheKey(matchMode),
+    cacheKey: getDailyPickCacheKey(matchMode, publicationDate),
     data,
     updatedAt: Date.now(),
     error: null,
     status: 'published',
   };
 
-  dailyPickRuntimeCaches.set(matchMode, runtimeCache);
+  if (publicationDate === getLocalDateKey()) dailyPickRuntimeCaches.set(matchMode, runtimeCache);
 
   return runtimeCache;
 };
 
-const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
+const upsertPublishedDailyPick = async (data, mode = 'prelive', storageDate = null) => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
+  const publicationDate = storageDate || data?.selection?.analysisDate || getLocalDateKey();
   assertDailyPickPublication(data);
   const payload = JSON.stringify(data);
 
@@ -1758,10 +1912,10 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
        generation_token = NULL,
        generated_at = CURRENT_TIMESTAMP,
        updated_at = CURRENT_TIMESTAMP`,
-    [getLocalDateKey(), matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, payload]
+    [publicationDate, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, payload]
   );
 
-  await persistLegacyDailyPickCache(data, matchMode);
+  await persistLegacyDailyPickCache(data, matchMode, publicationDate);
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
   });
@@ -1770,32 +1924,33 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive') => {
   });
 
   const runtimeCache = {
-    cacheKey: getDailyPickCacheKey(matchMode),
+    cacheKey: getDailyPickCacheKey(matchMode, publicationDate),
     data,
     updatedAt: Date.now(),
     error: null,
     status: 'published',
   };
 
-  dailyPickRuntimeCaches.set(matchMode, runtimeCache);
+  if (publicationDate === getLocalDateKey()) dailyPickRuntimeCaches.set(matchMode, runtimeCache);
   return runtimeCache;
 };
 
-const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false } = {}) => {
+const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false, date = null } = {}) => {
   const matchMode = normalizeMatchMode(mode);
+  const storageDate = date || getLocalDateKey();
   await settlePendingAnalysisPredictions().catch((err) => {
     console.warn('Liquidacao automatica de previsoes ignorada:', err.message);
   });
   if (!force) {
-    const published = await readPublishedDailyPick(matchMode);
+    const published = await readPublishedDailyPickForDate(storageDate, matchMode);
     if (published?.data && hasDailyPickEvents(published)) {
-      dailyPickRuntimeCaches.set(matchMode, published);
+      if (storageDate === getLocalDateKey()) dailyPickRuntimeCaches.set(matchMode, published);
       return { ...published, reused: true };
     }
   }
 
-  const data = await fetchDailyAnalysis(matchMode);
-  const published = await upsertPublishedDailyPick(data, matchMode);
+  const data = await fetchDailyAnalysis(matchMode, date);
+  const published = await upsertPublishedDailyPick(data, matchMode, storageDate);
   return { ...published, reused: false };
 };
 
@@ -2006,13 +2161,16 @@ const startDailyPickScheduler = () => {
 
 app.get('/api/health', async (_req, res) => {
   try {
-    const [database, worker, publication, realOdds] = await Promise.all([
+    const [database, worker, publication, realOdds, operationalAlerts] = await Promise.all([
       get('SELECT CURRENT_TIMESTAMP AS now'),
       get("SELECT worker_name, status, last_seen_at FROM worker_heartbeats WHERE worker_name = 'daily-pick-publisher'"),
       get("SELECT analysis_date, status, updated_at FROM daily_analysis_publications WHERE match_mode = 'prelive' ORDER BY updated_at DESC LIMIT 1"),
       get(`SELECT COUNT(*) FILTER (WHERE captured_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours')::int AS snapshots_24h,
                   MAX(captured_at) AS last_captured_at
            FROM bookmaker_odds_snapshots`),
+      get(`SELECT COUNT(*) FILTER (WHERE status = 'open')::int AS open,
+                  COUNT(*) FILTER (WHERE status = 'open' AND severity = 'critical')::int AS critical
+           FROM analysis_operational_alerts`),
     ]);
     const workerAgeHours = worker?.last_seen_at
       ? (Date.now() - new Date(worker.last_seen_at).getTime()) / (60 * 60 * 1000)
@@ -2020,11 +2178,14 @@ app.get('/api/health', async (_req, res) => {
     const workerHealthy = workerAgeHours !== null && workerAgeHours <= Number(process.env.WORKER_HEARTBEAT_MAX_AGE_HOURS || 36);
     res.json({
       ok: Boolean(database),
-      status: workerHealthy || DAILY_PICK_READ_ONLY === false ? 'healthy' : 'degraded',
+      status: Number(operationalAlerts?.critical || 0) > 0
+        ? 'critical'
+        : workerHealthy || DAILY_PICK_READ_ONLY === false ? 'healthy' : 'degraded',
       database: { ok: Boolean(database) },
       dailyPickWorker: worker ? { ...worker, healthy: workerHealthy, ageHours: Number(workerAgeHours.toFixed(2)) } : { healthy: false, status: 'never_seen' },
       latestPublication: publication || null,
       realOdds: realOdds || { snapshots_24h: 0, last_captured_at: null },
+      operationalAlerts: operationalAlerts || { open: 0, critical: 0 },
     });
   } catch (error) {
     res.status(503).json({ ok: false, database: { ok: false }, error: 'Health check indisponivel.' });
@@ -2076,11 +2237,26 @@ app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, asy
     .map((mode) => normalizeMatchMode(mode))
     .filter((mode, index, list) => list.indexOf(mode) === index);
   const force = req.body?.force === true || req.query.force === 'true';
+  const rawRequestedDate = req.body?.date || req.query.date || null;
+  let requestedDate = null;
+  if (rawRequestedDate) {
+    try {
+      requestedDate = validateManualPublicationDate(rawRequestedDate, {
+        today: getLocalDateKey(),
+        maxDaysAhead: DAILY_PICK_MANUAL_MAX_DAYS_AHEAD,
+      });
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }
+  if (modes.includes('live') && requestedDate && requestedDate !== getLocalDateKey()) {
+    return res.status(400).json({ error: 'O modo live permite somente a data de hoje.' });
+  }
 
   try {
     const results = [];
     for (const mode of modes) {
-      const published = await generateAndPublishDailyPick({ mode, force });
+      const published = await generateAndPublishDailyPick({ mode, force, date: requestedDate });
       results.push({
         mode,
         status: published.status,
@@ -2094,7 +2270,7 @@ app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, asy
 
     res.json({
       success: true,
-      date: getLocalDateKey(),
+      date: requestedDate || results[0]?.selection?.analysisDate || getLocalDateKey(),
       provider: getDailyPickProvider(),
       cacheVersion: DAILY_PICK_CACHE_VERSION,
       results,
@@ -2461,6 +2637,14 @@ const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
   }
 };
 
+const requireAnalysisOperationsSecret = (req, res, next) => {
+  const configuredSecret = String(process.env.DAILY_PICK_PUBLISH_SECRET || '').trim();
+  const receivedSecret = String(req.headers['x-daily-pick-secret'] || '').trim();
+  if (!configuredSecret) return res.status(503).json({ error: 'Segredo operacional das analises nao configurado.' });
+  if (!receivedSecret || receivedSecret !== configuredSecret) return res.status(401).json({ error: 'Nao autorizado.' });
+  return next();
+};
+
 const normalizeSearchText = (value) => String(value || '')
   .normalize('NFD')
   .replace(/[\u0300-\u036f]/g, '')
@@ -2531,7 +2715,7 @@ const buildPublishedAnalysisResponse = async ({ date, mode = 'prelive', limit = 
   const published = await readPublishedDailyPickForDate(requestedDate, matchMode);
 
   if (!published?.data || !hasDailyPickEvents(published)) {
-    const state = await readDailyPickPublicationState(matchMode);
+    const state = await readDailyPickPublicationState(matchMode, requestedDate);
     return {
       ok: false,
       error: state?.status === 'failed'
@@ -2617,12 +2801,39 @@ app.post('/api/internal/analysis-predictions/settle', requireInternalDailyPickSe
   }
 });
 
-app.get('/api/internal/analysis-predictions/metrics', requireInternalDailyPickSecret, async (_req, res) => {
+app.get('/api/internal/analysis-predictions/metrics', requireAnalysisOperationsSecret, async (_req, res) => {
   try {
     res.json({ success: true, result: await getAnalysisPerformanceMetrics() });
   } catch (err) {
     console.error('Erro ao calcular metricas das previsoes:', err.message);
     res.status(500).json({ error: err.message || 'Erro ao calcular metricas.' });
+  }
+});
+
+app.get('/api/internal/analysis-predictions/backtest', requireAnalysisOperationsSecret, async (req, res) => {
+  try {
+    res.json({ success: true, result: await getProfessionalBacktest(req.query.days) });
+  } catch (err) {
+    logger.error('analysis_backtest_failed', { error: err.message });
+    res.status(500).json({ error: err.message || 'Erro ao executar backtest.' });
+  }
+});
+
+app.get('/api/internal/analysis-predictions/weight-recommendations', requireAnalysisOperationsSecret, async (req, res) => {
+  try {
+    res.json({ success: true, result: await getAnalysisWeightRecommendations(req.query.days) });
+  } catch (err) {
+    logger.error('analysis_weight_recommendations_failed', { error: err.message });
+    res.status(500).json({ error: err.message || 'Erro ao calcular recomendacoes de pesos.' });
+  }
+});
+
+app.get('/api/internal/analysis-operations', requireAnalysisOperationsSecret, async (_req, res) => {
+  try {
+    res.json({ success: true, result: await getAnalysisOperationalSnapshot() });
+  } catch (err) {
+    logger.error('analysis_operations_failed', { error: err.message });
+    res.status(500).json({ error: err.message || 'Erro ao consultar operacao das analises.' });
   }
 });
 
@@ -3224,6 +3435,7 @@ databaseReady.then(() => {
   const server = app.listen(PORT, () => {
     logger.info('server_started', { port: Number(PORT), environment: process.env.NODE_ENV || 'development' });
     startDailyPickScheduler();
+    startAnalysisOperationsMonitor();
   });
   const shutdown = (signal) => {
     logger.info('server_shutdown_started', { signal });
