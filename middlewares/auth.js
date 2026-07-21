@@ -6,6 +6,7 @@ const { isAdminAccount } = require('./accessPolicy');
 
 const COOKIE_NAME = process.env.AUTH_COOKIE_NAME || 'placarpro_session';
 const SESSION_HOURS = Math.max(1, Number(process.env.AUTH_SESSION_HOURS || 24));
+const SESSION_TOUCH_INTERVAL_MINUTES = Math.max(1, Number(process.env.AUTH_SESSION_TOUCH_INTERVAL_MINUTES || 5));
 
 function parseCookies(header = '') {
   return String(header).split(';').reduce((cookies, part) => {
@@ -75,7 +76,10 @@ async function authenticateToken(req, res, next) {
         return res.status(403).json({ error: 'Token CSRF invalido.', code: 'CSRF_INVALID' });
       }
 
-      await run('UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?', [claims.sid]);
+      await run(
+        "UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ? AND last_seen_at < CURRENT_TIMESTAMP - (? * interval '1 minute')",
+        [claims.sid, SESSION_TOUCH_INTERVAL_MINUTES]
+      );
     }
 
     req.user = { ...claims, role: account.role || (account.plano === 'premium' ? 'premium' : 'free') };
@@ -105,6 +109,7 @@ module.exports = {
   clearSessionCookie,
   csrfForSession,
   issueSessionToken,
+  sessionHours: SESSION_HOURS,
   requireAdmin,
   setSessionCookie,
 };

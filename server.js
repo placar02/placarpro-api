@@ -15,6 +15,7 @@ const {
   clearSessionCookie,
   csrfForSession,
   issueSessionToken,
+  sessionHours,
   setSessionCookie,
 } = require('./middlewares/auth');
 const { analysisMarketFamily, settlePredictionOutcome } = require('./services/analysisAccuracy');
@@ -23,6 +24,7 @@ const { validateManualPublicationDate } = require('./services/analysisDate');
 const { assertDailyPickPublication } = require('./services/dailyPickContract');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
+const { paymentBelongsToSession } = require('./services/paymentSession');
 
 const app = express();
 app.disable('x-powered-by');
@@ -35,6 +37,7 @@ const PREMIUM_ENTRY_LIMIT = 5;
 const PREMIUM_PLAN_PRICE = Number(process.env.PREMIUM_PLAN_PRICE_CENTS || 2000);
 const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
+const PASSWORD_RESET_TTL_MINUTES = Math.max(10, Number(process.env.PASSWORD_RESET_TTL_MINUTES || 30));
 const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
 const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
 const DAILY_PICK_MAX_CANDIDATES = Math.max(PREMIUM_ENTRY_LIMIT, Number(process.env.DAILY_PICK_MAX_CANDIDATES || 15));
@@ -985,12 +988,37 @@ const activatePremiumFromPayment = async (payment) => {
     }
     if (session.coupon_id && !session.coupon_redeemed) {
       const redeemed = await tx.run('UPDATE payment_sessions SET coupon_redeemed = TRUE WHERE id = ? AND coupon_redeemed = FALSE', [session.id]);
-      if (redeemed.changes) await tx.run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.coupon_id]);
+      if (redeemed.changes) {
+        const reservation = await tx.get("SELECT id FROM coupon_reservations WHERE external_id = ? AND coupon_id = ? AND status = 'reserved' FOR UPDATE", [session.external_id, session.coupon_id]);
+        if (reservation) {
+          await tx.run("UPDATE coupon_reservations SET status = 'redeemed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [reservation.id]);
+          await tx.run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session.coupon_id]);
+        } else {
+          const counted = await tx.run('UPDATE coupons SET uses_count = uses_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND (max_uses IS NULL OR uses_count < max_uses)', [session.coupon_id]);
+          if (!counted.changes) console.error('Pagamento aprovado para cupom legado sem capacidade reservada', { sessionId: session.id, couponId: session.coupon_id });
+        }
+      }
     }
 
     return session;
   });
 };
+
+const reserveCoupon = async ({ couponId, userId, externalId }) => {
+  if (!couponId) return;
+  await transaction(async (tx) => {
+    await tx.run("UPDATE coupon_reservations SET status = 'released', updated_at = CURRENT_TIMESTAMP WHERE coupon_id = ? AND status = 'reserved' AND expires_at <= CURRENT_TIMESTAMP", [couponId]);
+    const coupon = await tx.get('SELECT id, max_uses, uses_count FROM coupons WHERE id = ? AND active = TRUE FOR UPDATE', [couponId]);
+    if (!coupon) { const error = new Error('Cupom invalido, expirado ou esgotado.'); error.statusCode = 422; throw error; }
+    const pending = await tx.get("SELECT COUNT(*) AS total FROM coupon_reservations WHERE coupon_id = ? AND status = 'reserved' AND expires_at > CURRENT_TIMESTAMP", [couponId]);
+    if (coupon.max_uses !== null && Number(coupon.uses_count) + Number(pending?.total || 0) >= Number(coupon.max_uses)) {
+      const error = new Error('Cupom invalido, expirado ou esgotado.'); error.statusCode = 422; throw error;
+    }
+    await tx.run("INSERT INTO coupon_reservations (coupon_id, user_id, external_id, expires_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP + INTERVAL '30 minutes')", [couponId, userId, externalId]);
+  });
+};
+
+const releaseCouponReservation = (externalId) => run("UPDATE coupon_reservations SET status = 'released', updated_at = CURRENT_TIMESTAMP WHERE external_id = ? AND status = 'reserved'", [externalId]);
 
 const getMercadoPagoPaymentById = async (paymentId) => {
   if (!paymentId) return null;
@@ -1052,7 +1080,13 @@ const scraperGet = async (path, options = {}) => {
 
   for (let attempt = 1; attempt <= SCRAPER_RETRY_ATTEMPTS; attempt += 1) {
     try {
-      return await axios.get(`${PLACARPRO_API_URL}${path}`, options);
+      return await axios.get(`${PLACARPRO_API_URL}${path}`, {
+        ...options,
+        headers: {
+          ...(options.headers || {}),
+          ...(process.env.SCRAPER_INTERNAL_SECRET ? { 'x-scraper-secret': process.env.SCRAPER_INTERNAL_SECRET } : {}),
+        },
+      });
     } catch (err) {
       lastError = err;
       if (!isRetryableScraperError(err) || attempt >= SCRAPER_RETRY_ATTEMPTS) break;
@@ -2159,8 +2193,7 @@ const startDailyPickScheduler = () => {
   interval.unref?.();
 };
 
-app.get('/api/health', async (_req, res) => {
-  try {
+const getHealthSnapshot = async () => {
     const [database, worker, publication, realOdds, operationalAlerts] = await Promise.all([
       get('SELECT CURRENT_TIMESTAMP AS now'),
       get("SELECT worker_name, status, last_seen_at FROM worker_heartbeats WHERE worker_name = 'daily-pick-publisher'"),
@@ -2176,19 +2209,35 @@ app.get('/api/health', async (_req, res) => {
       ? (Date.now() - new Date(worker.last_seen_at).getTime()) / (60 * 60 * 1000)
       : null;
     const workerHealthy = workerAgeHours !== null && workerAgeHours <= Number(process.env.WORKER_HEARTBEAT_MAX_AGE_HOURS || 36);
-    res.json({
+    const status = Number(operationalAlerts?.critical || 0) > 0
+      ? 'critical'
+      : workerHealthy || DAILY_PICK_READ_ONLY === false ? 'healthy' : 'degraded';
+    return {
       ok: Boolean(database),
-      status: Number(operationalAlerts?.critical || 0) > 0
-        ? 'critical'
-        : workerHealthy || DAILY_PICK_READ_ONLY === false ? 'healthy' : 'degraded',
+      ready: Boolean(database) && status !== 'critical',
+      status,
       database: { ok: Boolean(database) },
       dailyPickWorker: worker ? { ...worker, healthy: workerHealthy, ageHours: Number(workerAgeHours.toFixed(2)) } : { healthy: false, status: 'never_seen' },
       latestPublication: publication || null,
       realOdds: realOdds || { snapshots_24h: 0, last_captured_at: null },
       operationalAlerts: operationalAlerts || { open: 0, critical: 0 },
-    });
+    };
+};
+
+app.get('/api/health', async (_req, res) => {
+  try {
+    res.json(await getHealthSnapshot());
   } catch (error) {
     res.status(503).json({ ok: false, database: { ok: false }, error: 'Health check indisponivel.' });
+  }
+});
+
+app.get('/api/ready', async (_req, res) => {
+  try {
+    const health = await getHealthSnapshot();
+    res.status(health.ready ? 200 : 503).json(health);
+  } catch (error) {
+    res.status(503).json({ ok: false, ready: false, database: { ok: false }, error: 'Readiness indisponivel.' });
   }
 });
 
@@ -2206,7 +2255,8 @@ app.post('/api/internal/worker/heartbeat', requireWorkerSecret, async (req, res)
   await run(`INSERT INTO worker_heartbeats (worker_name, status, details, last_seen_at, updated_at)
     VALUES ('daily-pick-publisher', ?, ?::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ON CONFLICT (worker_name) DO UPDATE SET status = EXCLUDED.status, details = EXCLUDED.details,
-      last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP`, [status, JSON.stringify(details)]);
+      last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    RETURNING worker_name`, [status, JSON.stringify(details)]);
   res.json({ success: true, status });
 });
 
@@ -2386,8 +2436,78 @@ app.post('/api/payments/trial', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/auth/password/forgot', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const genericMessage = 'Se o email estiver cadastrado, voce recebera as instrucoes para redefinir sua senha.';
+  if (!email || email.length > 255) return res.status(400).json({ error: 'Informe um email valido.' });
+
+  const deliveryUrl = String(process.env.PASSWORD_RESET_WEBHOOK_URL || '').trim();
+  const exposeToken = process.env.NODE_ENV !== 'production' && process.env.EXPOSE_PASSWORD_RESET_TOKEN === 'true';
+  if (!deliveryUrl && !exposeToken) {
+    return res.status(503).json({ error: 'Recuperacao de senha temporariamente indisponivel.' });
+  }
+
+  try {
+    const user = await get('SELECT id, nome, email FROM users WHERE LOWER(email) = ?', [email]);
+    if (!user) return res.json({ success: true, message: genericMessage });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await transaction(async (tx) => {
+      await tx.run('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND used_at IS NULL', [user.id]);
+      await tx.run(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + (? * interval '1 minute'))",
+        [user.id, tokenHash, PASSWORD_RESET_TTL_MINUTES]
+      );
+    });
+
+    const resetUrl = `${String(process.env.FRONTEND_URL || '').replace(/\/$/, '')}/redefinir-senha?token=${encodeURIComponent(token)}`;
+    if (deliveryUrl) {
+      await axios.post(deliveryUrl, {
+        type: 'password_reset',
+        recipient: { name: user.nome, email: user.email },
+        resetUrl,
+        expiresInMinutes: PASSWORD_RESET_TTL_MINUTES,
+      }, { timeout: 10000 });
+    }
+    res.json({ success: true, message: genericMessage, ...(exposeToken ? { resetToken: token } : {}) });
+  } catch (error) {
+    logger.error('password_reset_request_failed', { error: error.message });
+    res.status(502).json({ error: 'Nao foi possivel enviar as instrucoes agora.' });
+  }
+});
+
+app.post('/api/auth/password/reset', async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const senha = String(req.body?.senha || '');
+  if (!/^[a-f0-9]{64}$/i.test(token) || senha.length < 8) {
+    return res.status(400).json({ error: 'Token ou nova senha invalidos.' });
+  }
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const hashedPassword = await bcrypt.hash(senha, 10);
+    const changed = await transaction(async (tx) => {
+      const reset = await tx.get(
+        'SELECT id, user_id FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP FOR UPDATE',
+        [tokenHash]
+      );
+      if (!reset) return false;
+      await tx.run('UPDATE users SET senha = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [hashedPassword, reset.user_id]);
+      await tx.run('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = ?', [reset.id]);
+      await tx.run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ?', [reset.user_id]);
+      return true;
+    });
+    if (!changed) return res.status(400).json({ error: 'Token invalido, expirado ou ja utilizado.' });
+    return res.json({ success: true, message: 'Senha redefinida com sucesso.' });
+  } catch (error) {
+    logger.error('password_reset_failed', { error: error.message });
+    return res.status(500).json({ error: 'Nao foi possivel redefinir a senha.' });
+  }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   const { nome, email, senha } = req.body;
+  const normalizedEmail = String(email || '').trim().toLowerCase();
 
   if (!nome || !email || !senha) {
     return res.status(400).json({ error: 'Todos os campos sao obrigatorios' });
@@ -2398,25 +2518,28 @@ app.post('/api/auth/register', async (req, res) => {
   }
 
   try {
-    const existingUser = await get('SELECT id FROM users WHERE email = ?', [email]);
+    const existingUser = await get('SELECT id FROM users WHERE LOWER(email) = ?', [normalizedEmail]);
     if (existingUser) {
       return res.status(400).json({ error: 'Email ja cadastrado' });
     }
 
     const hashedPassword = await bcrypt.hash(senha, 10);
-    const result = await run(
-      'INSERT INTO users (nome, email, senha) VALUES (?, ?, ?)',
-      [nome, email, hashedPassword]
-    );
-
     const sessionId = crypto.randomUUID();
-    await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, result.id]);
-    const user = { id: result.id, nome, email, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 };
+    const result = await transaction(async (tx) => {
+      const created = await tx.run(
+        'INSERT INTO users (nome, email, senha) VALUES (?, ?, ?)',
+        [String(nome).trim(), normalizedEmail, hashedPassword]
+      );
+      await tx.run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + (? * interval '1 hour'))", [sessionId, created.id, sessionHours]);
+      return created;
+    });
+    const user = { id: result.id, nome: String(nome).trim(), email: normalizedEmail, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 };
     const token = issueSessionToken(user, sessionId);
     setSessionCookie(res, token);
     res.json({ csrfToken: csrfForSession(sessionId), user });
   } catch (err) {
     console.error(err);
+    if (err.code === '23505') return res.status(400).json({ error: 'Email ja cadastrado' });
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
@@ -2425,7 +2548,7 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, senha } = req.body;
 
   try {
-    const user = await get('SELECT * FROM users WHERE email = ?', [email]);
+    const user = await get('SELECT * FROM users WHERE LOWER(email) = ?', [String(email || '').trim().toLowerCase()]);
     if (!user) {
       return res.status(400).json({ error: 'Usuario ou senha incorretos' });
     }
@@ -2439,17 +2562,22 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(403).json({ error: 'Usuario bloqueado. Entre em contato com o suporte.' });
     }
 
-    await run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ? AND expires_at <= CURRENT_TIMESTAMP', [user.id]);
-    const accessSettings = await get('SELECT max_accesses FROM payment_settings WHERE id = 1');
-    const activeSessions = await get('SELECT COUNT(*)::int total FROM user_sessions WHERE user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.id]);
-    if (Number(activeSessions?.total || 0) >= Number(accessSettings?.max_accesses || 1)) {
-      return res.status(403).json({ error: `Limite de ${accessSettings?.max_accesses || 1} acesso(s) simultaneo(s) atingido.` });
-    }
-
-    await run('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
     const userRole = user.role || (user.plano === 'premium' ? 'premium' : 'free');
     const sessionId = crypto.randomUUID();
-    await run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + interval '24 hours')", [sessionId, user.id]);
+    const sessionResult = await transaction(async (tx) => {
+      await tx.get('SELECT id FROM users WHERE id = ? FOR UPDATE', [user.id]);
+      await tx.run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ? AND expires_at <= CURRENT_TIMESTAMP', [user.id]);
+      const accessSettings = await tx.get('SELECT max_accesses FROM payment_settings WHERE id = 1');
+      const maxAccesses = Number(accessSettings?.max_accesses || 1);
+      const activeSessions = await tx.get('SELECT COUNT(*)::int total FROM user_sessions WHERE user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.id]);
+      if (Number(activeSessions?.total || 0) >= maxAccesses) return { allowed: false, maxAccesses };
+      await tx.run('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
+      await tx.run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + (? * interval '1 hour'))", [sessionId, user.id, sessionHours]);
+      return { allowed: true, maxAccesses };
+    });
+    if (!sessionResult.allowed) {
+      return res.status(403).json({ error: `Limite de ${sessionResult.maxAccesses} acesso(s) simultaneo(s) atingido.` });
+    }
     const token = issueSessionToken({ id: user.id, email: user.email, role: userRole }, sessionId);
     setSessionCookie(res, token);
     res.json({
@@ -2623,6 +2751,7 @@ const proxyAnalysis = async (req, res, upstreamPath, extraQuery = {}) => {
     const params = analysisQueryParams({ ...req.query, ...extraQuery });
     const response = await axios.get(`${PLACARPRO_API_URL}${upstreamPath}?${params}`, {
       timeout: Number(process.env.ANALYSIS_PROXY_TIMEOUT_MS || 360000),
+      headers: process.env.SCRAPER_INTERNAL_SECRET ? { 'x-scraper-secret': process.env.SCRAPER_INTERNAL_SECRET } : undefined,
     });
 
     res.status(response.status).json(response.data);
@@ -2930,17 +3059,24 @@ app.put('/api/bankroll', authenticateToken, async (req, res) => {
   }
 
   try {
-    await run('UPDATE users SET banca_inicial = ?, saldo_atual = ? WHERE id = ?', [valor, valor, req.user.id]);
-    await run('DELETE FROM bankroll_history WHERE user_id = ?', [req.user.id]);
-
-    if (valor > 0) {
-      await run('INSERT INTO bankroll_history (user_id, dia, saldo) VALUES (?, ?, ?)', [req.user.id, 1, valor]);
-    }
+    await transaction(async (tx) => {
+      const user = await tx.get('SELECT id FROM users WHERE id = ? FOR UPDATE', [req.user.id]);
+      if (!user) {
+        const error = new Error('Usuario nao encontrado.');
+        error.statusCode = 404;
+        throw error;
+      }
+      await tx.run('UPDATE users SET banca_inicial = ?, saldo_atual = ? WHERE id = ?', [valor, valor, req.user.id]);
+      await tx.run('DELETE FROM bankroll_history WHERE user_id = ?', [req.user.id]);
+      if (valor > 0) {
+        await tx.run('INSERT INTO bankroll_history (user_id, dia, saldo) VALUES (?, ?, ?)', [req.user.id, 1, valor]);
+      }
+    });
 
     res.json({ success: true, banca_inicial: valor, saldo: valor });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Erro ao atualizar banca' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : 'Erro ao atualizar banca' });
   }
 });
 
@@ -2959,44 +3095,49 @@ app.post('/api/bets/place', authenticateToken, async (req, res) => {
   }
 
   try {
-    const user = await get('SELECT saldo_atual FROM users WHERE id = ?', [req.user.id]);
-    const saldo = Number(user?.saldo_atual || 0);
-
-    if (saldo <= 0) {
-      return res.status(400).json({ error: 'Configure sua banca antes de registrar entradas.' });
-    }
-
-    if (valorApostado > saldo) {
-      return res.status(400).json({ error: 'O valor da entrada nao pode ser maior que sua banca atual.' });
-    }
-
     const eventId = entry.eventId ? String(entry.eventId) : null;
     const market = entry.market || null;
     const recommendation = entry.recommendation || null;
+    const result = await transaction(async (tx) => {
+      const user = await tx.get('SELECT saldo_atual FROM users WHERE id = ? FOR UPDATE', [req.user.id]);
+      const saldo = Number(user?.saldo_atual || 0);
+      if (!user || saldo <= 0) {
+        const error = new Error('Configure sua banca antes de registrar entradas.');
+        error.statusCode = 400;
+        throw error;
+      }
+      if (valorApostado > saldo) {
+        const error = new Error('O valor da entrada nao pode ser maior que sua banca atual.');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    const duplicate = eventId && market && recommendation
-      ? await get(
-        "SELECT id FROM bets WHERE user_id = ? AND event_id = ? AND market = ? AND recommendation = ? AND resultado = 'pending'",
-        [req.user.id, eventId, market, recommendation]
-      )
-      : null;
+      if (eventId && market && recommendation) {
+        const duplicate = await tx.get(
+          "SELECT id FROM bets WHERE user_id = ? AND event_id = ? AND market = ? AND recommendation = ? AND resultado = 'pending' FOR UPDATE",
+          [req.user.id, eventId, market, recommendation]
+        );
+        if (duplicate) {
+          const error = new Error('Voce ja registrou essa entrada e ela ainda esta pendente.');
+          error.statusCode = 400;
+          throw error;
+        }
+      }
 
-    if (duplicate) {
-      return res.status(400).json({ error: 'Voce ja registrou essa entrada e ela ainda esta pendente.' });
-    }
-
-    const novoSaldo = saldo - valorApostado;
-    const countHistory = await get('SELECT COUNT(*) as c FROM bankroll_history WHERE user_id = ?', [req.user.id]);
-
-    await run('UPDATE users SET saldo_atual = ? WHERE id = ?', [novoSaldo, req.user.id]);
-    const createdBet = await run(
-      'INSERT INTO bets (user_id, jogo, odd, valor_apostado, resultado, lucro_prejuizo, event_id, market, recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, gameName || 'Jogo Desconhecido', oddNumber, valorApostado, 'pending', 0, eventId, market, recommendation]
-    );
-    await run(
-      'INSERT INTO bankroll_history (user_id, dia, saldo) VALUES (?, ?, ?)',
-      [req.user.id, Number(countHistory.c || 0) + 1, novoSaldo]
-    );
+      const novoSaldo = Number((saldo - valorApostado).toFixed(2));
+      const history = await tx.get('SELECT COALESCE(MAX(dia), 0)::int AS last_day FROM bankroll_history WHERE user_id = ?', [req.user.id]);
+      await tx.run('UPDATE users SET saldo_atual = ? WHERE id = ?', [novoSaldo, req.user.id]);
+      const createdBet = await tx.run(
+        'INSERT INTO bets (user_id, jogo, odd, valor_apostado, resultado, lucro_prejuizo, event_id, market, recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [req.user.id, gameName || 'Jogo Desconhecido', oddNumber, valorApostado, 'pending', 0, eventId, market, recommendation]
+      );
+      await tx.run(
+        'INSERT INTO bankroll_history (user_id, dia, saldo) VALUES (?, ?, ?)',
+        [req.user.id, Number(history?.last_day || 0) + 1, novoSaldo]
+      );
+      return { novoSaldo, createdBet };
+    });
+    const { novoSaldo, createdBet } = result;
 
     res.json({
       success: true,
@@ -3017,7 +3158,8 @@ app.post('/api/bets/place', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Erro ao registrar entrada' });
+    if (err.code === '23505') return res.status(400).json({ error: 'Voce ja registrou essa entrada e ela ainda esta pendente.' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : 'Erro ao registrar entrada' });
   }
 });
 
@@ -3034,58 +3176,75 @@ app.post('/api/bets/resolve', authenticateToken, async (req, res) => {
   }
 
   try {
-    const [user, pendingBet] = await Promise.all([
-      get('SELECT saldo_atual FROM users WHERE id = ?', [req.user.id]),
-      betId ? get("SELECT * FROM bets WHERE id = ? AND user_id = ? AND resultado = 'pending'", [betId, req.user.id]) : Promise.resolve(null),
-    ]);
-    let saldo = Number(user.saldo_atual || 0);
-    let valorApostado = Number(pendingBet?.valor_apostado ?? req.body?.valorApostado);
-    const finalOdd = Number(pendingBet?.odd || oddNumber);
-    const finalGameName = pendingBet?.jogo || gameName || 'Jogo Desconhecido';
+    const resolution = await transaction(async (tx) => {
+      const user = await tx.get('SELECT saldo_atual FROM users WHERE id = ? FOR UPDATE', [req.user.id]);
+      if (!user) {
+        const error = new Error('Usuario nao encontrado.');
+        error.statusCode = 404;
+        throw error;
+      }
+      const pendingBet = betId
+        ? await tx.get("SELECT * FROM bets WHERE id = ? AND user_id = ? AND resultado = 'pending' FOR UPDATE", [betId, req.user.id])
+        : null;
+      if (betId && !pendingBet) {
+        const error = new Error('Entrada nao encontrada ou ja resolvida.');
+        error.statusCode = 409;
+        throw error;
+      }
+      let saldo = Number(user.saldo_atual || 0);
+      let valorApostado = Number(pendingBet?.valor_apostado ?? req.body?.valorApostado);
+      const finalOdd = Number(pendingBet?.odd || oddNumber);
+      const finalGameName = pendingBet?.jogo || gameName || 'Jogo Desconhecido';
 
-    if (!Number.isFinite(finalOdd) || finalOdd <= 1) {
-      return res.status(400).json({ error: 'Odd invalida' });
-    }
+      if (!Number.isFinite(finalOdd) || finalOdd <= 1) {
+        const error = new Error('Odd invalida');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    if (!Number.isFinite(valorApostado) || valorApostado <= 0) {
-      valorApostado = Math.min(saldo, Math.max(1, saldo * 0.02));
-    }
+      if (!Number.isFinite(valorApostado) || valorApostado <= 0) {
+        valorApostado = Math.min(saldo, Math.max(1, saldo * 0.02));
+      }
 
-    if (!pendingBet) {
-      valorApostado = Math.min(valorApostado, saldo);
-    }
+      if (!pendingBet) valorApostado = Math.min(valorApostado, saldo);
 
-    if (valorApostado <= 0) {
-      return res.status(400).json({ error: 'Configure sua banca antes de registrar apostas.' });
-    }
+      if (valorApostado <= 0) {
+        const error = new Error('Configure sua banca antes de registrar apostas.');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    let lucroPrejuizo = 0;
-    if (resultado === 'green') {
-      lucroPrejuizo = (valorApostado * finalOdd) - valorApostado;
-      saldo += pendingBet ? valorApostado * finalOdd : lucroPrejuizo;
-    } else {
-      lucroPrejuizo = -valorApostado;
-      saldo += pendingBet ? 0 : lucroPrejuizo;
-    }
+      let lucroPrejuizo = 0;
+      if (resultado === 'green') {
+        lucroPrejuizo = Number(((valorApostado * finalOdd) - valorApostado).toFixed(2));
+        saldo += pendingBet ? valorApostado * finalOdd : lucroPrejuizo;
+      } else {
+        lucroPrejuizo = -valorApostado;
+        saldo += pendingBet ? 0 : lucroPrejuizo;
+      }
+      saldo = Number(saldo.toFixed(2));
 
-    await run('UPDATE users SET saldo_atual = ? WHERE id = ?', [saldo, req.user.id]);
-    if (pendingBet) {
-      await run(
+      await tx.run('UPDATE users SET saldo_atual = ? WHERE id = ?', [saldo, req.user.id]);
+      if (pendingBet) {
+        await tx.run(
         'UPDATE bets SET resultado = ?, lucro_prejuizo = ? WHERE id = ? AND user_id = ?',
         [resultado, lucroPrejuizo, pendingBet.id, req.user.id]
-      );
-    } else {
-      await run(
+        );
+      } else {
+        await tx.run(
         'INSERT INTO bets (user_id, jogo, odd, valor_apostado, resultado, lucro_prejuizo) VALUES (?, ?, ?, ?, ?, ?)',
         [req.user.id, finalGameName, finalOdd, valorApostado, resultado, lucroPrejuizo]
-      );
-    }
+        );
+      }
 
-    const countHistory = await get('SELECT COUNT(*) as c FROM bankroll_history WHERE user_id = ?', [req.user.id]);
-    await run(
+      const history = await tx.get('SELECT COALESCE(MAX(dia), 0)::int AS last_day FROM bankroll_history WHERE user_id = ?', [req.user.id]);
+      await tx.run(
       'INSERT INTO bankroll_history (user_id, dia, saldo) VALUES (?, ?, ?)',
-      [req.user.id, Number(countHistory.c || 0) + 1, saldo]
-    );
+        [req.user.id, Number(history?.last_day || 0) + 1, saldo]
+      );
+      return { saldo, valorApostado, finalOdd, finalGameName, lucroPrejuizo, pendingBet };
+    });
+    const { saldo, valorApostado, finalOdd, finalGameName, lucroPrejuizo, pendingBet } = resolution;
 
     res.json({
       success: true,
@@ -3106,7 +3265,7 @@ app.post('/api/bets/resolve', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Erro ao resolver aposta' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : 'Erro ao resolver aposta' });
   }
 });
 
@@ -3142,13 +3301,20 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       paymentPayload.notification_url = notificationUrl;
     }
 
-    const payment = await mercadoPagoRequest(
-      'POST',
-      '/v1/payments',
-      paymentPayload,
-      null,
-      { 'X-Idempotency-Key': `pix-${externalId}` }
-    );
+    await reserveCoupon({ couponId: coupon?.id, userId: req.user.id, externalId });
+    let payment;
+    try {
+      payment = await mercadoPagoRequest(
+        'POST',
+        '/v1/payments',
+        paymentPayload,
+        null,
+        { 'X-Idempotency-Key': `pix-${externalId}` }
+      );
+    } catch (error) {
+      await releaseCouponReservation(externalId).catch((releaseError) => console.error('Falha ao liberar reserva de cupom:', releaseError.message));
+      throw error;
+    }
     const transactionData = payment?.point_of_interaction?.transaction_data || {};
 
     await run(
@@ -3238,13 +3404,20 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
 
     console.info('Payload Mercado Pago cartao:', sanitizeMercadoPagoPayload(paymentPayload));
 
-    const payment = await mercadoPagoRequest(
-      'POST',
-      '/v1/payments',
-      paymentPayload,
-      null,
-      { 'X-Idempotency-Key': `card-${externalId}` }
-    );
+    await reserveCoupon({ couponId: coupon?.id, userId: req.user.id, externalId });
+    let payment;
+    try {
+      payment = await mercadoPagoRequest(
+        'POST',
+        '/v1/payments',
+        paymentPayload,
+        null,
+        { 'X-Idempotency-Key': `card-${externalId}` }
+      );
+    } catch (error) {
+      await releaseCouponReservation(externalId).catch((releaseError) => console.error('Falha ao liberar reserva de cupom:', releaseError.message));
+      throw error;
+    }
 
     await run(
       'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -3288,11 +3461,17 @@ app.get('/api/payments/checkout/:checkoutId/confirm', authenticateToken, async (
     if (!session) return res.status(404).json({ error: 'Checkout nao encontrado' });
 
     const paymentId = req.query.payment_id || req.query.collection_id;
+    if (paymentId && String(paymentId) !== String(session.checkout_id)) {
+      return res.status(400).json({ error: 'Pagamento nao pertence a este checkout.' });
+    }
     const payment = paymentId
       ? await getMercadoPagoPaymentById(paymentId)
       : await findMercadoPagoPaymentByExternalId(session.external_id);
 
     if (payment) {
+      if (!paymentBelongsToSession(payment, session)) {
+        return res.status(409).json({ error: 'Pagamento nao corresponde a sessao informada.' });
+      }
       await activatePremiumFromPayment(payment);
     }
 
@@ -3314,11 +3493,17 @@ app.get('/api/payments/session/:externalId/confirm', authenticateToken, async (r
     if (!session) return res.status(404).json({ error: 'Sessao de pagamento nao encontrada' });
 
     const paymentId = req.query.payment_id || req.query.collection_id;
+    if (paymentId && String(paymentId) !== String(session.checkout_id)) {
+      return res.status(400).json({ error: 'Pagamento nao pertence a esta sessao.' });
+    }
     const payment = paymentId
       ? await getMercadoPagoPaymentById(paymentId)
       : await findMercadoPagoPaymentByExternalId(session.external_id);
 
     if (payment) {
+      if (!paymentBelongsToSession(payment, session)) {
+        return res.status(409).json({ error: 'Pagamento nao corresponde a sessao informada.' });
+      }
       await activatePremiumFromPayment(payment);
     }
 

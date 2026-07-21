@@ -69,13 +69,20 @@ async function main() {
 
 async function sendHeartbeat(status, details = {}) {
   try {
-    await fetch(`${heartbeatUrl}/api/internal/worker/heartbeat`, {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(`${heartbeatUrl}/api/internal/worker/heartbeat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-daily-pick-secret': secret },
       body: JSON.stringify({ status, details }),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    return true;
   } catch (error) {
     console.warn(`Heartbeat ${status} nao enviado: ${error.message}`);
+    return false;
   }
 }
 
