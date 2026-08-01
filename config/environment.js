@@ -24,6 +24,12 @@ function validateEnvironment(env = process.env) {
     if (env.MERCADOPAGO_ACCESS_TOKEN && isPlaceholder(env.MERCADOPAGO_WEBHOOK_SECRET)) {
       errors.push('MERCADOPAGO_WEBHOOK_SECRET e obrigatoria quando pagamentos estao ativos.');
     }
+    if (env.AUTH_COOKIE_SAME_SITE === 'none' && env.FRONTEND_URL && !String(env.FRONTEND_URL).startsWith('https://')) {
+      errors.push('FRONTEND_URL deve usar HTTPS quando AUTH_COOKIE_SAME_SITE=none.');
+    }
+    if (env.ALLOW_PAYMENT_TEST_APPROVAL === 'true' || env.EXPOSE_PASSWORD_RESET_TOKEN === 'true') {
+      errors.push('Recursos exclusivos de teste nao podem estar ativos em producao.');
+    }
   }
 
   if (errors.length) {

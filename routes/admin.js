@@ -3,16 +3,17 @@ const controller = require('../controllers/adminController');
 const { authenticateToken, requireAdmin } = require('../middlewares/auth');
 const { adminRateLimit } = require('../middlewares/adminRateLimit');
 const { validateBody } = require('../validators/adminValidators');
+const { validateIdParam } = require('../validators/publicValidators');
 
 const router = express.Router();
 router.use(authenticateToken, requireAdmin, adminRateLimit());
 router.get('/dashboard', controller.dashboard);
 router.get('/users', controller.users);
-router.get('/users/:id', controller.user);
-router.put('/users/:id', validateBody('user', true), controller.updateUser);
-router.patch('/users/:id', validateBody('user', true), controller.updateUser);
-router.patch('/users/:id/password', adminRateLimit({ windowMs: 900000, max: 10 }), controller.changePassword);
-router.delete('/users/:id', adminRateLimit({ windowMs: 900000, max: 20 }), controller.deleteUser);
+router.get('/users/:id', validateIdParam(), controller.user);
+router.put('/users/:id', validateIdParam(), validateBody('user', true), controller.updateUser);
+router.patch('/users/:id', validateIdParam(), validateBody('user', true), controller.updateUser);
+router.patch('/users/:id/password', validateIdParam(), adminRateLimit({ windowMs: 900000, max: 10 }), controller.changePassword);
+router.delete('/users/:id', validateIdParam(), adminRateLimit({ windowMs: 900000, max: 20 }), controller.deleteUser);
 
 const plans = controller.resource('plans');
 router.get('/plans', plans.list);

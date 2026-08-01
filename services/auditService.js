@@ -1,4 +1,5 @@
 const { run } = require('../db');
+const logger = require('./logger');
 
 async function audit(req, action, entityType, entityId, oldValues, newValues) {
   return run(
@@ -10,10 +11,10 @@ async function audit(req, action, entityType, entityId, oldValues, newValues) {
       action,
       entityType,
       entityId == null ? null : String(entityId),
-      oldValues == null ? null : JSON.stringify(oldValues),
-      newValues == null ? null : JSON.stringify(newValues),
-      req.ip || null,
-      req.headers['user-agent'] || null,
+      oldValues == null ? null : JSON.stringify(logger.redact(oldValues)),
+      newValues == null ? null : JSON.stringify(logger.redact(newValues)),
+      logger.anonymizeIp(req.ip),
+      String(req.headers['user-agent'] || '').slice(0, 500) || null,
     ]
   );
 }

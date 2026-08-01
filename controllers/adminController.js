@@ -2,6 +2,7 @@ const bcrypt = require('bcrypt');
 const { run, get } = require('../db');
 const service = require('../services/adminService');
 const { audit } = require('../services/auditService');
+const { strongPassword } = require('../validators/publicValidators');
 
 const safe = (handler) => async (req, res, next) => {
   try { await handler(req, res); } catch (error) { next(error); }
@@ -33,10 +34,10 @@ const deleteUser = safe(async (req, res) => {
   return res.status(204).end();
 });
 const changePassword = safe(async (req, res) => {
-  if (String(req.body.password || '').length < 8) return res.status(422).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
+  if (!strongPassword(req.body.password)) return res.status(422).json({ error: 'A senha deve ter 10 caracteres, maiuscula, minuscula e numero.' });
   const userExists = await get('SELECT id FROM users WHERE id = ?', [req.params.id]);
   if (!userExists) return res.status(404).json({ error: 'Usuario nao encontrado.' });
-  const password = await bcrypt.hash(req.body.password, 10);
+  const password = await bcrypt.hash(req.body.password, 12);
   await run('UPDATE users SET senha = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [password, req.params.id]);
   await audit(req, 'user.password_change', 'user', req.params.id, null, { password_changed: true });
   return res.json({ success: true });

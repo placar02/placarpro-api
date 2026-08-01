@@ -14,7 +14,9 @@ function parseCookies(header = '') {
     if (separator < 0) return cookies;
     const key = part.slice(0, separator).trim();
     const value = part.slice(separator + 1).trim();
-    if (key) cookies[key] = decodeURIComponent(value);
+    if (key) {
+      try { cookies[key] = decodeURIComponent(value); } catch (_error) { cookies[key] = value; }
+    }
     return cookies;
   }, {});
 }
@@ -31,10 +33,12 @@ function safeEqual(left, right) {
 
 function cookieOptions() {
   const production = process.env.NODE_ENV === 'production';
+  const configuredSameSite = String(process.env.AUTH_COOKIE_SAME_SITE || (production ? 'none' : 'lax')).toLowerCase();
+  const sameSite = ['strict', 'lax', 'none'].includes(configuredSameSite) ? configuredSameSite : 'lax';
   return {
     httpOnly: true,
     secure: production,
-    sameSite: process.env.AUTH_COOKIE_SAME_SITE || (production ? 'none' : 'lax'),
+    sameSite,
     path: '/',
     maxAge: SESSION_HOURS * 60 * 60 * 1000,
   };
@@ -51,6 +55,9 @@ function clearSessionCookie(res) {
 
 function issueSessionToken(user, sessionId) {
   return jwt.sign({ id: user.id, email: user.email, role: user.role, sid: sessionId }, getJwtSecret(), {
+    algorithm: 'HS256',
+    issuer: 'placarpro-api',
+    audience: 'placarpro-web',
     expiresIn: `${SESSION_HOURS}h`,
   });
 }
@@ -63,7 +70,7 @@ async function authenticateToken(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Autenticacao necessaria.' });
 
   try {
-    const claims = jwt.verify(token, getJwtSecret());
+    const claims = jwt.verify(token, getJwtSecret(), { algorithms: ['HS256'], issuer: 'placarpro-api', audience: 'placarpro-web' });
     const account = await get('SELECT id, email, role, plano, status FROM users WHERE id = ?', [claims.id]);
     if (!account || account.status === 'blocked') return res.status(403).json({ error: 'Acesso negado.' });
 

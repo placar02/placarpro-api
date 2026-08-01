@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
+const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -26,9 +28,12 @@ const { assertDailyPickPublication } = require('./services/dailyPickContract');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
 const { paymentBelongsToSession } = require('./services/paymentSession');
+const { rateLimit, requestTimeout, slowDown } = require('./middlewares/security');
+const { cleanText, strongPassword, validateAuth } = require('./validators/publicValidators');
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 
 const FRONTEND_URL = process.env.FRONTEND_URL ;
 const PLACARPRO_API_URL = process.env.PLACARPRO_API_URL ;
@@ -83,6 +88,14 @@ const allowedOrigins = (process.env.CORS_ORIGINS || `${FRONTEND_URL},http://loca
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+app.use(helmet({
+  contentSecurityPolicy: { directives: { defaultSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'none'"], formAction: ["'none'"], upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null } },
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'same-site' },
+  hsts: process.env.NODE_ENV === 'production' ? { maxAge: 31_536_000, includeSubDomains: true, preload: true } : false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+}));
+app.use(compression({ threshold: 1024 }));
 app.use(cors({
   origin(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
@@ -92,7 +105,8 @@ app.use(cors({
 }));
 
 app.use((req, res, next) => {
-  const requestId = String(req.headers['x-request-id'] || crypto.randomUUID());
+  const suppliedRequestId = String(req.headers['x-request-id'] || '');
+  const requestId = /^[a-zA-Z0-9_-]{8,80}$/.test(suppliedRequestId) ? suppliedRequestId : crypto.randomUUID();
   const startedAt = Date.now();
   req.requestId = requestId;
   res.setHeader('X-Request-Id', requestId);
@@ -102,39 +116,15 @@ app.use((req, res, next) => {
     path: req.originalUrl.split('?')[0],
     status: res.statusCode,
     durationMs: Date.now() - startedAt,
+    actorUserId: req.user?.id || null,
+    ipHash: logger.anonymizeIp(req.ip),
   }));
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Cache-Control', 'no-store');
   next();
 });
 
-const rateLimitBuckets = new Map();
-const rateLimit = ({ windowMs, max, keyPrefix }) => (req, res, next) => {
-  const now = Date.now();
-  if (rateLimitBuckets.size > 5000) {
-    for (const [bucketKey, value] of rateLimitBuckets) {
-      if (now > value.resetAt) rateLimitBuckets.delete(bucketKey);
-    }
-  }
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const key = `${keyPrefix}:${ip}`;
-  const bucket = rateLimitBuckets.get(key);
-
-  if (!bucket || now > bucket.resetAt) {
-    rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
-    return next();
-  }
-
-  bucket.count += 1;
-  if (bucket.count > max) {
-    return res.status(429).json({ error: 'Muitas tentativas. Tente novamente em instantes.' });
-  }
-
-  return next();
-};
+app.use(requestTimeout(Number(process.env.REQUEST_TIMEOUT_MS || 30_000)));
 
 app.use(express.json({
   limit: '100kb',
@@ -168,8 +158,10 @@ const requirePremium = async (req, res, next) => {
   }
 };
 
-app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyPrefix: 'auth' }));
-app.use('/api/payments', rateLimit({ windowMs: 60 * 1000, max: 40, keyPrefix: 'payments' }));
+app.use('/api', rateLimit({ windowMs: 60_000, max: 180, prefix: 'public-api' }));
+app.use('/api/analysis', slowDown({ windowMs: 60_000, delayAfter: 8, prefix: 'analysis-slow' }), rateLimit({ windowMs: 60_000, max: 30, prefix: 'analysis' }));
+app.use('/api/payments', rateLimit({ windowMs: 60_000, max: 30, prefix: 'payments' }));
+app.use('/api/payments/webhook', rateLimit({ windowMs: 60_000, max: 120, prefix: 'mp-webhook' }));
 app.use('/api/admin', adminRoutes);
 
 app.get('/api/settings/public', async (_req, res) => {
@@ -1011,6 +1003,18 @@ const sanitizeMercadoPagoPayload = (payload = {}) => ({
   has_notification_url: Boolean(payload.notification_url),
 });
 
+const paymentAuditSnapshot = (payment = {}) => JSON.stringify({
+  id: payment.id,
+  status: payment.status,
+  status_detail: payment.status_detail,
+  external_reference: payment.external_reference,
+  transaction_amount: payment.transaction_amount,
+  currency_id: payment.currency_id,
+  date_approved: payment.date_approved,
+  payment_method_id: payment.payment_method_id,
+});
+const paymentDigest = (payment = {}) => crypto.createHash('sha256').update(JSON.stringify(payment)).digest('hex');
+
 const isPublicHttpsUrl = (value) => {
   try {
     const url = new URL(value);
@@ -1031,8 +1035,8 @@ const activatePremiumFromPayment = async (payment) => {
     if (!session) return null;
 
     await tx.run(
-      'UPDATE payment_sessions SET status = ?, raw_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [payment.status || 'pending', JSON.stringify(payment), session.id]
+      'UPDATE payment_sessions SET status = ?, raw_payload = ?, payload_digest = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [payment.status || 'pending', paymentAuditSnapshot(payment), paymentDigest(payment), session.id]
     );
 
     if (!isPaidStatus(payment.status)) return session;
@@ -2925,7 +2929,7 @@ app.post('/api/payments/trial', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/auth/password/forgot', async (req, res) => {
+app.post('/api/auth/password/forgot', rateLimit({ windowMs: 15 * 60_000, max: 5, prefix: 'password-forgot' }), validateAuth('forgot'), async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const genericMessage = 'Se o email estiver cadastrado, voce recebera as instrucoes para redefinir sua senha.';
   if (!email || email.length > 255) return res.status(400).json({ error: 'Informe um email valido.' });
@@ -2966,15 +2970,15 @@ app.post('/api/auth/password/forgot', async (req, res) => {
   }
 });
 
-app.post('/api/auth/password/reset', async (req, res) => {
+app.post('/api/auth/password/reset', rateLimit({ windowMs: 15 * 60_000, max: 5, prefix: 'password-reset' }), async (req, res) => {
   const token = String(req.body?.token || '').trim();
   const senha = String(req.body?.senha || '');
-  if (!/^[a-f0-9]{64}$/i.test(token) || senha.length < 8) {
+  if (!/^[a-f0-9]{64}$/i.test(token) || !strongPassword(senha)) {
     return res.status(400).json({ error: 'Token ou nova senha invalidos.' });
   }
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const hashedPassword = await bcrypt.hash(senha, 10);
+    const hashedPassword = await bcrypt.hash(senha, 12);
     const changed = await transaction(async (tx) => {
       const reset = await tx.get(
         'SELECT id, user_id FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP FOR UPDATE',
@@ -2994,16 +2998,12 @@ app.post('/api/auth/password/reset', async (req, res) => {
   }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rateLimit({ windowMs: 60 * 60_000, max: 5, prefix: 'register' }), validateAuth('register'), async (req, res) => {
   const { nome, email, senha } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
 
   if (!nome || !email || !senha) {
     return res.status(400).json({ error: 'Todos os campos sao obrigatorios' });
-  }
-
-  if (String(senha).length < 8) {
-    return res.status(400).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
   }
 
   try {
@@ -3012,7 +3012,7 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Email ja cadastrado' });
     }
 
-    const hashedPassword = await bcrypt.hash(senha, 10);
+    const hashedPassword = await bcrypt.hash(senha, 12);
     const sessionId = crypto.randomUUID();
     const result = await transaction(async (tx) => {
       const created = await tx.run(
@@ -3020,6 +3020,10 @@ app.post('/api/auth/register', async (req, res) => {
         [String(nome).trim(), normalizedEmail, hashedPassword]
       );
       await tx.run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + (? * interval '1 hour'))", [sessionId, created.id, sessionHours]);
+      const ipHash = logger.anonymizeIp(req.ip);
+      const userAgent = String(req.headers['user-agent'] || '').slice(0, 500) || null;
+      await tx.run('INSERT INTO user_consents (user_id, consent_type, policy_version, granted, ip_hash, user_agent) VALUES (?, ?, ?, TRUE, ?, ?)', [created.id, 'privacy', process.env.PRIVACY_POLICY_VERSION || '2026-08-01', ipHash, userAgent]);
+      await tx.run('INSERT INTO user_consents (user_id, consent_type, policy_version, granted, ip_hash, user_agent) VALUES (?, ?, ?, TRUE, ?, ?)', [created.id, 'terms', process.env.TERMS_VERSION || '2026-08-01', ipHash, userAgent]);
       return created;
     });
     const user = { id: result.id, nome: String(nome).trim(), email: normalizedEmail, plano: 'basico', role: 'free', status: 'active', saldo: 0, banca_inicial: 0 };
@@ -3033,7 +3037,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60_000, max: 8, prefix: 'login' }), slowDown({ windowMs: 15 * 60_000, delayAfter: 3, delayMs: 400, prefix: 'login-slow' }), validateAuth('login'), async (req, res) => {
   const { email, senha } = req.body;
 
   try {
@@ -3410,6 +3414,38 @@ app.get('/api/analysis/events/:eventIds', authenticateToken, requirePremium, asy
   }
 
   return proxyAnalysis(req, res, `/analysis/${eventIds.join(',')}`);
+});
+
+app.get('/api/privacy/export', authenticateToken, rateLimit({ windowMs: 60 * 60_000, max: 3, prefix: 'privacy-export' }), async (req, res, next) => {
+  try {
+    const [user, bets, subscriptions, consents] = await Promise.all([
+      get('SELECT id, nome, email, plano, role, status, banca_inicial, saldo_atual, data_cadastro, updated_at FROM users WHERE id = ?', [req.user.id]),
+      all('SELECT id, jogo, odd, valor_apostado, resultado, lucro_prejuizo, data, event_id, market, recommendation FROM bets WHERE user_id = ? ORDER BY id', [req.user.id]),
+      all('SELECT id, status, trial_ends_at, starts_at, ends_at, cancelled_at, created_at FROM subscriptions WHERE user_id = ? ORDER BY id', [req.user.id]),
+      all('SELECT consent_type, policy_version, granted, created_at FROM user_consents WHERE user_id = ? ORDER BY id', [req.user.id]),
+    ]);
+    const requestId = crypto.randomUUID();
+    await run("INSERT INTO data_subject_requests (id, user_id, request_type, status, completed_at) VALUES (?, ?, 'export', 'completed', CURRENT_TIMESTAMP)", [requestId, req.user.id]);
+    res.setHeader('Content-Disposition', `attachment; filename="placarpro-dados-${req.user.id}.json"`);
+    return res.json({ exportedAt: new Date().toISOString(), requestId, user, bets, subscriptions, consents });
+  } catch (error) { return next(error); }
+});
+
+app.post('/api/privacy/delete-request', authenticateToken, rateLimit({ windowMs: 24 * 60 * 60_000, max: 2, prefix: 'privacy-delete' }), async (req, res, next) => {
+  if (cleanText(req.body?.confirmation, 20).toUpperCase() !== 'EXCLUIR') return res.status(422).json({ error: 'Digite EXCLUIR para confirmar.' });
+  try {
+    const requestId = crypto.randomUUID();
+    const anonymousEmail = `deleted+${crypto.randomUUID()}@invalid.placarpro`;
+    const unusablePassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+    await transaction(async (tx) => {
+      await tx.run("INSERT INTO data_subject_requests (id, user_id, request_type, status, completed_at, details) VALUES (?, ?, 'deletion', 'completed', CURRENT_TIMESTAMP, ?::jsonb)", [requestId, req.user.id, JSON.stringify({ method: 'immediate_anonymization' })]);
+      await tx.run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ?', [req.user.id]);
+      await tx.run('DELETE FROM password_reset_tokens WHERE user_id = ?', [req.user.id]);
+      await tx.run("UPDATE users SET nome = 'Usuario excluido', email = ?, senha = ?, status = 'blocked', banca_inicial = 0, saldo_atual = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [anonymousEmail, unusablePassword, req.user.id]);
+    });
+    clearSessionCookie(res);
+    return res.json({ success: true, requestId, status: 'completed', message: 'Conta anonimizada e acesso revogado.' });
+  } catch (error) { return next(error); }
 });
 
 app.post('/api/internal/analysis-predictions/settle', requireInternalDailyPickSecret, async (req, res) => {
@@ -3810,8 +3846,8 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
     const transactionData = payment?.point_of_interaction?.transaction_data || {};
 
     await run(
-      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, transactionData.ticket_url, JSON.stringify(payment)]
+      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, transactionData.ticket_url, paymentAuditSnapshot(payment), paymentDigest(payment)]
     );
 
     res.json({
@@ -3912,8 +3948,8 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     }
 
     await run(
-      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, null, JSON.stringify(payment)]
+      'INSERT INTO payment_sessions (user_id, checkout_id, external_id, status, plan, plan_id, coupon_id, original_amount, discount_cents, amount, checkout_url, raw_payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [req.user.id, payment.id, externalId, payment.status || 'pending', plan.slug || 'premium', plan.id, coupon?.id || null, originalAmount, discountCents, finalAmount, null, paymentAuditSnapshot(payment), paymentDigest(payment)]
     );
 
     await activatePremiumFromPayment(payment);
