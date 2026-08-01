@@ -59,7 +59,21 @@ O sistema exige `ANALYSIS_WEIGHT_MIN_SAMPLE`, limita sugestoes entre 0.90 e 1.10
 - snapshots recentes de odds;
 - disponibilidade e falhas por provedor de odds.
 
-Alertas sao persistidos em `analysis_operational_alerts`. Quando a condicao desaparece, o alerta e resolvido automaticamente. O monitor nao chama SofaScore, OGOL, 365Scores ou casas de aposta.
+Alertas sao persistidos em `analysis_operational_alerts`. Quando a condicao desaparece, o alerta e resolvido automaticamente. O monitor nao chama OGOL, 365Scores ou casas de aposta.
+
+## Cobertura do pipeline
+
+Cada publicacao salva o diagnostico em `selection.pipeline` no registro da analise diaria. O mesmo objeto e emitido pelo scraper no log `[DailyAnalysisCoverage]`.
+
+Os campos de `stages` mostram a cobertura da agenda ate a publicacao:
+
+- `agenda`, `afterFilters` e `quickTriage`;
+- `inspected` e `inspectionFailed`;
+- `dataQuality`, `featureEngine` e `decisionEngine`;
+- `oddsMatched`, `expectedValue` e `confidence`;
+- `decisionApproved`, `waitingOdds`, `rejected` e `published`.
+
+`schedule.providers` informa quantas partidas vieram de OGOL e 365Scores, incluindo erros e duracao. `discarded` identifica evento, campeonato, times, etapa e motivos. Uma partida com etapa `publication_ranking` foi aprovada pelos motores, mas ficou fora do limite final; ela nao deve ser contabilizada como rejeicao estatistica.
 
 Configure `ANALYSIS_ALERT_WEBHOOK_URL` para enviar alertas novos ou reativados ao Slack, Teams ou a uma automacao propria. Falha no webhook nao interrompe a API.
 

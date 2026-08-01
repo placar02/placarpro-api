@@ -1,4 +1,6 @@
-function validateDailyPickPublication(payload) {
+const { validateDailyEvent } = require('./dailyEventEligibility');
+
+function validateDailyPickPublication(payload, options = {}) {
   const errors = [];
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { valid: false, errors: ['payload deve ser um objeto'] };
@@ -19,13 +21,26 @@ function validateDailyPickPublication(payload) {
     const ids = payload.selectedEvents.map((event) => event?.id).filter((id) => id !== undefined && id !== null);
     if (ids.length !== payload.selectedEvents.length) errors.push('toda partida deve possuir id');
     if (new Set(ids.map(String)).size !== ids.length) errors.push('selectedEvents nao pode conter partidas duplicadas');
+    const requestedDate = options.date || payload?.selection?.analysisDate;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(requestedDate || ''))) {
+      errors.push('selection.analysisDate deve possuir data valida');
+    } else {
+      for (const event of payload.selectedEvents) {
+        const validation = validateDailyEvent(event, requestedDate, {
+          mode: options.mode || payload.matchMode,
+          timeZone: options.timeZone,
+          nowMs: options.nowMs,
+        });
+        if (!validation.valid) errors.push(`partida ${event?.id ?? 'sem-id'} invalida para publicacao: ${validation.reason}`);
+      }
+    }
   }
 
   return { valid: errors.length === 0, errors };
 }
 
-function assertDailyPickPublication(payload) {
-  const validation = validateDailyPickPublication(payload);
+function assertDailyPickPublication(payload, options = {}) {
+  const validation = validateDailyPickPublication(payload, options);
   if (!validation.valid) {
     const error = new Error(`Publicacao diaria invalida: ${validation.errors.join('; ')}`);
     error.code = 'INVALID_DAILY_PICK_PUBLICATION';

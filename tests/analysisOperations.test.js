@@ -63,12 +63,12 @@ test('mede disponibilidade real por provedor de odds a partir da auditoria', () 
   const payloadRows = Array.from({ length: 4 }, (_, index) => ({ payload: {
     bestEntry: { meta: { oddsAudit: { providers: [
       { source: 'betano', status: index === 0 ? 'available' : 'unavailable', oddsFound: index === 0 ? 12 : 0, reason: index ? 'timeout' : undefined },
-      { source: 'sofascore', status: 'available', oddsFound: 5 },
+      { source: '365scores', status: 'available', oddsFound: 5 },
     ] } } },
   } }));
   const reliability = buildOddsProviderReliability(payloadRows);
   assert.equal(reliability.find((item) => item.provider === 'betano').availabilityRate, 0.25);
-  assert.equal(reliability.find((item) => item.provider === 'sofascore').availabilityRate, 1);
+  assert.equal(reliability.find((item) => item.provider === '365scores').availabilityRate, 1);
 });
 
 test('processa lote grande de forma deterministica sem chamadas externas', () => {

@@ -21,6 +21,7 @@ const {
 const { analysisMarketFamily, settlePredictionOutcome } = require('./services/analysisAccuracy');
 const { buildBacktestReport, buildOddsProviderReliability, buildWeightRecommendations, evaluateOperationalAlerts } = require('./services/analysisOperations');
 const { validateManualPublicationDate } = require('./services/analysisDate');
+const { auditDailyEvents, filterDailyPickForPublication, markPipelineReportsPublished } = require('./services/dailyEventEligibility');
 const { assertDailyPickPublication } = require('./services/dailyPickContract');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
@@ -39,9 +40,17 @@ const PREMIUM_PLAN_PRICE_BRL = Number((PREMIUM_PLAN_PRICE / 100).toFixed(2));
 const PREMIUM_PRODUCT_EXTERNAL_ID = process.env.MERCADOPAGO_PREMIUM_PRODUCT_EXTERNAL_ID || 'placarpro-premium';
 const PASSWORD_RESET_TTL_MINUTES = Math.max(10, Number(process.env.PASSWORD_RESET_TTL_MINUTES || 30));
 const DAILY_PICK_ANALYSIS_TIMEOUT_MS = Number(process.env.DAILY_PICK_ANALYSIS_TIMEOUT_MS || 120000);
-const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 1));
+const DAILY_PICK_ANALYSIS_CONCURRENCY = Math.max(1, Number(process.env.DAILY_PICK_ANALYSIS_CONCURRENCY || 4));
 const DAILY_PICK_MAX_CANDIDATES = Math.max(PREMIUM_ENTRY_LIMIT, Number(process.env.DAILY_PICK_MAX_CANDIDATES || 15));
 const DAILY_PICK_FULL_DAILY_TIMEOUT_MS = Number(process.env.DAILY_PICK_FULL_DAILY_TIMEOUT_MS || 360000);
+const DAILY_PICK_FULL_DAILY_JOB_WAIT_MS = Math.max(
+  DAILY_PICK_FULL_DAILY_TIMEOUT_MS,
+  Number(process.env.DAILY_PICK_FULL_DAILY_JOB_WAIT_MS || 15 * 60 * 1000)
+);
+const DAILY_PICK_SCHEDULE_TIMEOUT_MS = Math.max(
+  60000,
+  Number(process.env.DAILY_PICK_SCHEDULE_TIMEOUT_MS || 180000)
+);
 const DAILY_PICK_FAST_TIMEOUT_MS = Number(process.env.DAILY_PICK_FAST_TIMEOUT_MS || 20000);
 const SCRAPER_RETRY_ATTEMPTS = Math.max(1, Number(process.env.SCRAPER_RETRY_ATTEMPTS || 3));
 const SCRAPER_RETRY_DELAY_MS = Math.max(250, Number(process.env.SCRAPER_RETRY_DELAY_MS || 2500));
@@ -227,6 +236,14 @@ const sanitizeProviderText = (value, fallback = '') => {
   return sanitized || fallback;
 };
 
+const sanitizeTournamentName = (value, fallback = '') => {
+  const sanitized = sanitizeProviderText(value, '');
+  const normalized = sanitized.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const looksLikeScoreboardLeak = /\d/.test(normalized)
+    && /(?:intervalo|preview|encerrado|ao vivo|red bull|coritiba|palmeiras|atletico)/.test(normalized);
+  return looksLikeScoreboardLeak ? fallback : sanitized || fallback;
+};
+
 const getTeamImageUrl = (team) => {
   const value = team?.imageUrl || team?.imageSmall || team?.image || null;
   if (!value) return null;
@@ -344,6 +361,7 @@ const isFallbackEntry = (entry) => {
 
 const isUsableAnalysis = (analysis) => {
   if (!analysis || analysis.analysisSource === 'fallback-provider') return false;
+  if (analysis.analysisStatus !== 'approved') return false;
   if (String(analysis.recommendation || '').toLowerCase() === 'error') return false;
   if (Number(analysis.confidence || 0) <= 0) return false;
   if (analysis?.meta?.accuracyValidation?.approved === false) return false;
@@ -477,6 +495,13 @@ const applyHistoricalCalibration = (analysis, calibration) => {
 };
 
 const comparePublishedAnalyses = (left, right) => {
+  const statusRank = (analysis) => {
+    if (analysis?.analysisStatus === 'approved') return 3;
+    if (analysis?.analysisStatus === 'waiting_odds') return 2;
+    return 1;
+  };
+  const statusGap = statusRank(right) - statusRank(left);
+  if (statusGap !== 0) return statusGap;
   const leftConfidence = Number(left?.confidence || 0);
   const rightConfidence = Number(right?.confidence || 0);
   if ((leftConfidence > 0) !== (rightConfidence > 0)) return leftConfidence > 0 ? -1 : 1;
@@ -603,6 +628,39 @@ const deduplicateEventsByFixture = (events = []) => {
   return [...unique.values()];
 };
 
+const normalizeFixtureTeam = (value) => String(value || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+  .replace(/\b(fc|cf|ac|ec|sc|futebol clube)\b/g, '')
+  .replace(/[^a-z0-9]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const findMatchingFixture = (events = [], reference = {}) => {
+  const home = normalizeFixtureTeam(reference?.homeTeam?.name || reference?.homeTeamName || reference?.home_team);
+  const away = normalizeFixtureTeam(reference?.awayTeam?.name || reference?.awayTeamName || reference?.away_team);
+  const timestamp = getEventStartTimestamp(reference)
+    || (reference?.kickoff_at ? Math.floor(new Date(reference.kickoff_at).getTime() / 1000) : 0);
+  if (!home || !away) return null;
+
+  return events
+    .map((event) => {
+      const direct = normalizeFixtureTeam(event?.homeTeam?.name) === home
+        && normalizeFixtureTeam(event?.awayTeam?.name) === away;
+      const reversed = normalizeFixtureTeam(event?.homeTeam?.name) === away
+        && normalizeFixtureTeam(event?.awayTeam?.name) === home;
+      const timeDifference = timestamp && getEventStartTimestamp(event)
+        ? Math.abs(timestamp - getEventStartTimestamp(event))
+        : Number.POSITIVE_INFINITY;
+      return { event, teamsMatch: direct || reversed, timeDifference };
+    })
+    .filter((item) => item.teamsMatch)
+    .sort((a, b) => a.timeDifference - b.timeDifference)
+    .find((item) => !timestamp || item.timeDifference <= 6 * 60 * 60)
+    ?.event || null;
+};
+
 const filterEligibleDailyEvents = (events = []) => deduplicateEventsByFixture(events.filter(isTodayUpcomingEvent))
   .sort((a, b) => getEventStartTimestamp(a) - getEventStartTimestamp(b));
 
@@ -641,6 +699,7 @@ const normalizeEntry = (entry, events = []) => {
     rationale: summarizeText(fullRationale),
     analysisSummary: summarizeText(fullRationale),
     advancedAnalysis: {
+      matchAnalysis: entry.matchAnalysis || null,
       dataCoverage: entry.dataCoverage || null,
       keyFactors: Array.isArray(entry.keyFactors) ? entry.keyFactors : [],
       playerAnalysis: entry.playerAnalysis || null,
@@ -657,7 +716,10 @@ const normalizeEntry = (entry, events = []) => {
     awayTeamName: sanitizeProviderText(matchedEvent?.awayTeam?.name || entry.awayTeamName, 'Fora'),
     homeTeamImageUrl: getTeamImageUrl(matchedEvent?.homeTeam) || entry.homeTeamImageUrl || entry.homeTeam?.imageUrl || null,
     awayTeamImageUrl: getTeamImageUrl(matchedEvent?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
-    tournamentName: sanitizeProviderText(matchedEvent?.tournament?.name || entry.tournamentName, ''),
+    tournamentName: sanitizeTournamentName(
+      entry.tournamentName,
+      sanitizeTournamentName(matchedEvent?.tournament?.name, ''),
+    ),
     startTimestamp: matchedEvent?.startTimestamp || entry.startTimestamp || null,
     round: matchedEvent?.round ?? matchedEvent?.roundInfo?.round ?? entry.round ?? null,
     venue: matchedEvent?.venue?.name && !/^unknown$/i.test(String(matchedEvent.venue.name))
@@ -1065,6 +1127,7 @@ const getMercadoPagoPayerEmail = (preferredEmail, fallbackEmail) => {
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const isRetryableScraperError = (err) => [429, 502, 503, 504].includes(Number(err.response?.status));
+const isScraperAuthenticationError = (err) => [401, 403].includes(Number(err.response?.status));
 
 const getPublicDailyPickError = (error) => {
   const text = String(error || '');
@@ -1140,12 +1203,12 @@ const enrichEventsWithOdds = async (events = [], limit = 100) => {
   ];
 };
 
-const waitForAnalysisJob = async (initialPayload) => {
+const waitForAnalysisJob = async (initialPayload, timeoutMs = DAILY_PICK_ANALYSIS_TIMEOUT_MS) => {
   let payload = initialPayload;
   const jobId = payload?.jobId;
   if (!payload?.pending || !jobId) return payload;
 
-  const deadline = Date.now() + DAILY_PICK_ANALYSIS_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
 
   while (payload?.pending && Date.now() < deadline) {
     const delay = Math.max(750, Math.min(5000, Number(payload.pollAfterMs || 1500)));
@@ -1160,11 +1223,15 @@ const waitForAnalysisJob = async (initialPayload) => {
   if (payload?.pending) {
     throw new Error(`Analise ${jobId} ainda em processamento apos timeout.`);
   }
+  if (payload?.ok === false || payload?.status === 'failed') {
+    throw new Error(payload?.error || `Analise ${jobId} falhou.`);
+  }
 
   return payload;
 };
 
-const analyzeDailyEvents = async (events = []) => {
+const analyzeDailyEvents = async (events = [], options = {}) => {
+  const fresh = options.fresh === true;
   const analyses = [];
   let index = 0;
 
@@ -1176,8 +1243,8 @@ const analyzeDailyEvents = async (events = []) => {
 
       try {
         const analysisRes = await scraperGet(
-          `/analysis/${event.id}?includeOdds=true&useOddsFallback=false&requireRealOdds=${DAILY_PICK_REQUIRE_REAL_ODDS}&minimumExpectedValue=${DAILY_PICK_MIN_EXPECTED_VALUE}&wait=true&useLLM=true&useLLMExplanation=true&explainRejected=true`,
-          { timeout: DAILY_PICK_ANALYSIS_TIMEOUT_MS }
+          `/analysis/${event.id}?includeOdds=true&useOddsFallback=false&requireRealOdds=${DAILY_PICK_REQUIRE_REAL_ODDS}&minimumExpectedValue=${DAILY_PICK_MIN_EXPECTED_VALUE}&wait=false&useLLM=true&useLLMExplanation=true&explainRejected=true&fresh=${fresh}`,
+          { timeout: DAILY_PICK_FAST_TIMEOUT_MS }
         );
         const analysisPayload = await waitForAnalysisJob(analysisRes.data);
         if (analysisPayload?.ok === false || analysisPayload?.status === 'failed') {
@@ -1185,13 +1252,16 @@ const analyzeDailyEvents = async (events = []) => {
         }
 
         const analysis = analysisPayload?.result;
-        const oddsData = ENABLE_ODDS_ENRICHMENT ? await fetchEventOdds(event.id) : null;
+        // A rota de análise já foi chamada com includeOdds=true e requireRealOdds.
+        // Reconsultar /odds/:id aqui duplicava a coleta e, para IDs agregados do
+        // Flashscore, podia encaminhar ao provider incorreto.
+        const oddsData = null;
         const enrichedAnalysis = {
           ...(oddsData ? enrichAnalysisWithOdds(analysis, oddsData) : analysis),
           championshipPriority: analysis?.championshipPriority || event?.championshipPriority,
         };
 
-        if (ENABLE_ODDS_ENRICHMENT && !hasRealOddEntry(enrichedAnalysis, [event])) {
+        if (DAILY_PICK_REQUIRE_REAL_ODDS && !hasRealOddEntry(enrichedAnalysis, [event])) {
           console.warn(`Analise da IA para o evento ${event.id} veio sem odd real casada.`);
         }
 
@@ -1307,8 +1377,54 @@ const getFastDailyPick = async (mode = 'prelive', state = null) => {
   return fastCache;
 };
 
-const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
-  const { matchMode, analysisDate, eligibleEvents } = await fetchDailyCandidateEvents(mode, 60000, requestedDate);
+const buildTriageFailureMessage = (fullDaily, discarded = []) => {
+  const reportReasons = fullDaily?.pipeline?.report?.summary?.rejectionReasons || [];
+  const reasons = [
+    ...discarded.map((item) => item?.reason),
+    ...reportReasons.flatMap((item) => (item?.reasons || []).map((reason) =>
+      `${item.fixture || item.eventId || 'Partida'} [${item.eliminatedAt || 'pipeline'}]: ${reason}`)),
+  ].filter(Boolean);
+  const uniqueReasons = [...new Set(reasons)].slice(0, 8);
+  const summary = fullDaily?.pipeline?.report?.summary || {};
+  const counts = [
+    `encontradas=${Number(summary.totalFound || fullDaily?.matchesFound || 0)}`,
+    `dataQuality=${Number(summary.dataQualityApproved || 0)}`,
+    `decision=${Number(summary.decisionApproved || 0)}`,
+    `aguardandoOdds=${Number(summary.waitingOdds || 0)}`,
+  ].join(', ');
+  return uniqueReasons.length
+    ? `Nenhuma partida chegou à publicação (${counts}). Causas: ${uniqueReasons.join(' | ')}`
+    : `Nenhuma partida chegou à publicação (${counts}). Consulte selection.pipeline.report.matches para o histórico de cada gate.`;
+};
+
+const isBrazilianSerieACoverage = (value = {}) => {
+  const text = [
+    value?.tournamentName,
+    value?.tournament?.name,
+    value?.tournament?.slug,
+    value?.competition?.name,
+    value?.competition?.slug,
+    value?.championshipPriority?.competitionName,
+  ].filter(Boolean).join(' ').toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const country = String(
+    value?.tournament?.category?.country?.name
+    || value?.category?.country?.name
+    || value?.country
+    || '',
+  ).toLowerCase();
+  return /(?:brasileirao|brasileiro).*serie a|serie a.*(?:brasil|brazil)/.test(`${text} ${country}`)
+    || (/\bserie a\b/.test(text) && /^(?:bra|brasil|brazil)$/.test(country));
+};
+
+const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null, execution = {}) => {
+  const { matchMode, analysisDate, eligibleEvents } = await fetchDailyCandidateEvents(
+    mode,
+    DAILY_PICK_SCHEDULE_TIMEOUT_MS,
+    requestedDate
+  );
+  const analysisRunId = execution.analysisRunId || crypto.randomUUID();
+  const freshAnalysis = execution.fresh === true;
 
   if (eligibleEvents.length === 0) {
     throw new Error(`Nenhuma partida pre-jogo elegivel foi encontrada em ${analysisDate}.`);
@@ -1318,12 +1434,13 @@ const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
     const params = new URLSearchParams({
       date: analysisDate,
       limit: String(PREMIUM_ENTRY_LIMIT),
-      maxCandidates: String(DAILY_PICK_MAX_CANDIDATES),
-      profileCandidateLimit: String(DAILY_PICK_MAX_CANDIDATES),
+      maxCandidates: String(Math.min(eligibleEvents.length, DAILY_PICK_MAX_CANDIDATES)),
+      profileCandidateLimit: String(Math.min(eligibleEvents.length, DAILY_PICK_MAX_CANDIDATES)),
+      analysisConcurrency: String(DAILY_PICK_ANALYSIS_CONCURRENCY),
       mode: matchMode,
       strictMarkets: 'false',
       strictFull: 'false',
-      wait: 'true',
+      wait: 'false',
       useLLM: 'true',
       useLLMExplanation: 'true',
       explainRejected: 'true',
@@ -1333,39 +1450,145 @@ const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
       minimumExpectedValue: String(DAILY_PICK_MIN_EXPECTED_VALUE),
       includeEnrichment: 'true',
       fullDailyCacheTtlMs: '0',
+      analysisCacheTtlMs: freshAnalysis ? '0' : String(Number(process.env.FULL_DAILY_ANALYSIS_CACHE_TTL_MS || 900000)),
+      fresh: String(freshAnalysis),
+      analysisRunId,
     });
+    console.info('[API]', JSON.stringify({
+      stage: 'scraper_request',
+      message: 'Solicitando analise ao scraper',
+      analysisRunId,
+      freshAnalysis,
+      scraperUrl: PLACARPRO_API_URL,
+      endpoint: '/analysis/full-daily',
+      date: analysisDate,
+      candidates: Math.min(eligibleEvents.length, DAILY_PICK_MAX_CANDIDATES),
+    }));
     const fullDailyRes = await scraperGet(`/analysis/full-daily?${params}`, {
-      timeout: DAILY_PICK_FULL_DAILY_TIMEOUT_MS,
+      timeout: DAILY_PICK_FAST_TIMEOUT_MS,
     });
-    const fullDaily = fullDailyRes.data?.result;
-    if (fullDailyRes.data?.ok === false || !fullDaily || !Array.isArray(fullDaily.analyses)) {
-      throw new Error(fullDailyRes.data?.error || 'Triagem diaria retornou um formato invalido.');
+    const fullDailyPayload = await waitForAnalysisJob(
+      fullDailyRes.data,
+      DAILY_PICK_FULL_DAILY_JOB_WAIT_MS
+    );
+    const fullDaily = fullDailyPayload?.result;
+    if (fullDailyPayload?.ok === false || !fullDaily || !Array.isArray(fullDaily.analyses)) {
+      throw new Error(fullDailyPayload?.error || 'Triagem diaria retornou um formato invalido.');
+    }
+    console.info('[API]', JSON.stringify({
+      stage: 'scraper_response',
+      message: 'Resposta recebida',
+      analysisRunId,
+      responseRunId: fullDaily.analysisRunId,
+      cache: Boolean(fullDailyPayload?.cache),
+      analyses: fullDaily.analyses.length,
+      approved: Number(fullDaily.pipeline?.stages?.decisionApproved || 0),
+    }));
+    if (freshAnalysis && fullDaily.analysisRunId !== analysisRunId) {
+      throw new Error(`Scraper retornou uma execucao diferente da solicitada (${fullDaily.analysisRunId || 'sem runId'} != ${analysisRunId}).`);
+    }
+    if (freshAnalysis && fullDaily.analyses.some((analysis) => analysis?.meta?.cacheHit === true)) {
+      throw new Error('Scraper reutilizou analise individual em uma execucao marcada como fresh.');
     }
 
     const eventById = new Map(eligibleEvents.map((event) => [String(event.id), event]));
-    const selectedEventById = new Map(
-      (Array.isArray(fullDaily.selectedEvents) ? fullDaily.selectedEvents : [])
-        .filter((event) => event?.id)
-        .map((event) => [String(event.id), event])
-    );
-    const selectedIds = (
+    const fullDailySelectedEvents = Array.isArray(fullDaily.selectedEvents) ? fullDaily.selectedEvents : [];
+    const rankedSelectedIds = (
       Array.isArray(fullDaily.selectedEventIds) && fullDaily.selectedEventIds.length
         ? fullDaily.selectedEventIds
-        : Array.from(selectedEventById.keys()).length
-          ? Array.from(selectedEventById.keys())
+        : Array.isArray(fullDaily.selectedEvents) && fullDaily.selectedEvents.length
+          ? fullDaily.selectedEvents.map((event) => event?.id).filter(Boolean)
           : fullDaily.analyses.map((analysis) => analysis.eventId)
     ).map(String);
-    const selectedEvents = selectedIds
-      .map((eventId) => selectedEventById.get(eventId) || eventById.get(eventId))
+    const priorityCoverageIds = fullDaily.analyses
+      .filter((analysis) => {
+        const event = eligibleEvents.find((candidate) => String(candidate?.id) === String(analysis?.eventId));
+        return isBrazilianSerieACoverage(analysis) || isBrazilianSerieACoverage(event);
+      })
+      .map((analysis) => String(analysis.eventId));
+    const selectedIds = [...new Set([...priorityCoverageIds, ...rankedSelectedIds])];
+    console.info('[PriorityCoverage]', JSON.stringify({
+      stage: 'publication_selection',
+      analysisRunId,
+      competition: 'Brasileirao Serie A',
+      eventIds: priorityCoverageIds,
+      fixtures: fullDaily.analyses
+        .filter((analysis) => priorityCoverageIds.includes(String(analysis.eventId)))
+        .map((analysis) => `${analysis?.homeTeam?.name || '?'} x ${analysis?.awayTeam?.name || '?'}`),
+    }));
+    // Only the API's already date-filtered schedule is authoritative for
+    // publication. The scraper response cannot reintroduce another date.
+    const selectedEventsBeforeValidation = selectedIds
+      .map((eventId) => {
+        const direct = eventById.get(eventId);
+        if (direct) return direct;
+        const scraperEvent = fullDailySelectedEvents.find((event) => String(event?.id) === eventId);
+        const authoritativeFixture = scraperEvent ? findMatchingFixture(eligibleEvents, scraperEvent) : null;
+        return authoritativeFixture && scraperEvent
+          ? { ...authoritativeFixture, id: scraperEvent.id, providerEventIds: scraperEvent.providerEventIds || authoritativeFixture.providerEventIds }
+          : null;
+      })
       .filter(Boolean);
+    const publicationEligibility = auditDailyEvents(selectedEventsBeforeValidation, analysisDate, {
+      mode: matchMode,
+      timeZone: process.env.DAILY_PICK_TIMEZONE || 'America/Sao_Paulo',
+    });
+    for (const { event, reason, eventDate } of publicationEligibility.discarded) {
+      console.warn('[DailyPickEligibility]', JSON.stringify({
+        decision: 'DESCARTADA',
+        reason,
+        requestedDate: analysisDate,
+        eventDate,
+        eventId: event?.id,
+        homeTeam: event?.homeTeam?.name,
+        awayTeam: event?.awayTeam?.name,
+      }));
+    }
+    const selectedEvents = publicationEligibility.eligible;
     if (selectedEvents.length === 0) {
-      throw new Error('Triagem diaria nao selecionou partidas elegiveis para publicacao.');
+      throw new Error(buildTriageFailureMessage(fullDaily, publicationEligibility.discarded));
     }
 
     const calibration = await loadPredictionCalibration();
     let analyses = fullDaily.analyses
       .filter((analysis) => selectedIds.includes(String(analysis.eventId)))
       .map((analysis) => applyHistoricalCalibration(analysis, calibration));
+    const priorityRetryEvents = selectedEvents.filter((event) => {
+      if (!priorityCoverageIds.includes(String(event.id))) return false;
+      const current = analyses.find((analysis) => String(analysis.eventId) === String(event.id));
+      return !current || current.analysisStatus !== 'approved';
+    });
+    let priorityRetryAudit = [];
+    if (priorityRetryEvents.length) {
+      console.info('[PriorityCoverage]', JSON.stringify({
+        stage: 'targeted_retry_started',
+        analysisRunId,
+        events: priorityRetryEvents.map((event) => ({
+          eventId: event.id,
+          fixture: `${event?.homeTeam?.name || '?'} x ${event?.awayTeam?.name || '?'}`,
+        })),
+      }));
+      const retried = (await analyzeDailyEvents(priorityRetryEvents, { fresh: true }))
+        .map((analysis) => applyHistoricalCalibration(analysis, calibration));
+      const retriedById = new Map(retried.map((analysis) => [String(analysis.eventId), analysis]));
+      analyses = analyses.map((analysis) => retriedById.get(String(analysis.eventId)) || analysis);
+      for (const analysis of retried) {
+        if (!analyses.some((current) => String(current.eventId) === String(analysis.eventId))) analyses.push(analysis);
+      }
+      priorityRetryAudit = priorityRetryEvents.map((event) => {
+        const before = fullDaily.analyses.find((analysis) => String(analysis.eventId) === String(event.id));
+        const after = retriedById.get(String(event.id));
+        return {
+          eventId: event.id,
+          fixture: `${event?.homeTeam?.name || '?'} x ${event?.awayTeam?.name || '?'}`,
+          before: before?.analysisStatus || 'missing',
+          after: after?.analysisStatus || before?.analysisStatus || 'missing',
+          reason: before?.analysisStatus === 'waiting_odds'
+            ? 'nova tentativa de odds'
+            : 'recoleta direcionada de dados',
+        };
+      });
+    }
     let analysisRetried = false;
     if (analyses.length === 0) {
       analysisRetried = true;
@@ -1404,22 +1627,41 @@ const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
         analysesPublished: publishableAnalyses.length,
         approvedEntries: approvedAnalyses.length,
         analysisRetried,
+        analysisRunId,
+        freshAnalysis,
+        generatedAt: fullDaily.generatedAt || new Date().toISOString(),
         policyVersion: DAILY_PICK_POLICY_VERSION,
         requireRealOdds: DAILY_PICK_REQUIRE_REAL_ODDS,
         minimumExpectedValue: DAILY_PICK_MIN_EXPECTED_VALUE,
         oddsAudit: buildOddsAuditReport(publishableAnalyses),
+        pipeline: fullDaily.pipeline || null,
         championshipPriority: fullDaily.prioritySummary || null,
         warning: analysisRetried
           ? `A triagem selecionou ${selectedEvents.length} partida(s) com os melhores dados disponiveis e concluiu a analise em uma nova tentativa.`
           : fullDaily.warning || null,
+        priorityCoverage: {
+          competition: 'Brasileirao Serie A',
+          eventIds: priorityCoverageIds,
+          retried: priorityRetryAudit,
+        },
       },
     };
   } catch (err) {
+    if (isScraperAuthenticationError(err)) {
+      throw new Error(
+        `Autenticacao interna com o scraper recusada (HTTP ${err.response?.status}). `
+        + 'Confirme que SCRAPER_INTERNAL_SECRET possui o mesmo valor na API e no scraper.'
+      );
+    }
+    if (freshAnalysis) {
+      throw new Error(`Execucao fresh ${analysisRunId} falhou e nao pode reutilizar fallback/cache: ${err.message}`);
+    }
     console.warn('Triagem por qualidade falhou; usando selecao compativel:', err.message);
-    const rankedEvents = ENABLE_ODDS_ENRICHMENT
-      ? await enrichEventsWithOdds(eligibleEvents)
-      : eligibleEvents;
-    const selectedEvents = rankedEvents.slice(0, PREMIUM_ENTRY_LIMIT);
+    // A triagem principal já ordena candidatos por qualidade. No fallback, consultar
+    // odds de toda a agenda antes de limitar os eventos causa uma tempestade de
+    // requisições (429/timeouts). Odds são buscadas abaixo apenas para as partidas
+    // efetivamente selecionadas e durante a própria análise.
+    const selectedEvents = eligibleEvents.slice(0, PREMIUM_ENTRY_LIMIT);
     const calibration = await loadPredictionCalibration();
     const analyses = (await analyzeDailyEvents(selectedEvents))
       .map((analysis) => applyHistoricalCalibration(analysis, calibration));
@@ -1444,7 +1686,9 @@ const fetchDailyAnalysis = async (mode = 'prelive', requestedDate = null) => {
         requireRealOdds: DAILY_PICK_REQUIRE_REAL_ODDS,
         minimumExpectedValue: DAILY_PICK_MIN_EXPECTED_VALUE,
         oddsAudit: buildOddsAuditReport(publishableAnalyses),
-        error: err.message,
+        error: null,
+        primaryTriageError: err.message,
+        fallbackRecovered: selectedEvents.length > 0 || publishableAnalyses.length > 0,
       },
     };
   }
@@ -1652,7 +1896,34 @@ const settlePendingAnalysisPredictions = async (limit = 50) => {
 
   for (const prediction of pending) {
     try {
-      const eventRes = await scraperGet(`/event/${prediction.event_id}`, { timeout: 30000 });
+      let resolvedEventId = prediction.event_id;
+      let eventRes;
+      try {
+        eventRes = await scraperGet(`/event/${resolvedEventId}`, { timeout: 30000 });
+      } catch (error) {
+        if (Number(error?.response?.status) !== 404 || !prediction.kickoff_at) throw error;
+        const date = getLocalDateKey(new Date(prediction.kickoff_at));
+        const scheduleRes = await scraperGet(
+          `/scheduled-matches?date=${date}`,
+          { timeout: DAILY_PICK_SCHEDULE_TIMEOUT_MS }
+        );
+        const scheduleEvents = scheduleRes.data?.data || scheduleRes.data?.events || [];
+        const matched = findMatchingFixture(scheduleEvents, prediction);
+        if (!matched?.id) {
+          summary.pending += 1;
+          console.warn(`Previsao ${prediction.id} aguardando liquidacao: evento nao localizado na agenda atual.`);
+          continue;
+        }
+        resolvedEventId = matched.id;
+        console.info('[PredictionSettlement]', JSON.stringify({
+          predictionId: prediction.id,
+          previousEventId: prediction.event_id,
+          resolvedEventId,
+          resolution: 'fixture-and-date',
+        }));
+        eventRes = await scraperGet(`/event/${resolvedEventId}`, { timeout: 30000 })
+          .catch(() => ({ data: { data: matched } }));
+      }
       const event = eventRes.data?.data || eventRes.data?.event || eventRes.data;
       const status = String(event?.status?.type || event?.status?.description || '').toLowerCase();
       if (!/finished|ended|final|afterextra|afterpenalties/.test(status)) {
@@ -1662,7 +1933,7 @@ const settlePendingAnalysisPredictions = async (limit = 50) => {
 
       let statistics = null;
       if (['corners', 'cards'].includes(prediction.market_family)) {
-        statistics = await scraperGet(`/event/${prediction.event_id}/statistics`, { timeout: 30000 })
+        statistics = await scraperGet(`/event/${resolvedEventId}/statistics`, { timeout: 30000 })
           .then((response) => response.data)
           .catch(() => null);
       }
@@ -1672,7 +1943,7 @@ const settlePendingAnalysisPredictions = async (limit = 50) => {
         continue;
       }
 
-      const closingOddsData = await fetchEventOdds(prediction.event_id);
+      const closingOddsData = await fetchEventOdds(resolvedEventId);
       const closingEntry = closingOddsData ? enrichEntryWithOdds({
         market: prediction.market,
         recommendation: prediction.recommendation,
@@ -1897,10 +2168,76 @@ const claimDailyPickGeneration = async (mode = 'prelive') => {
   return updated?.id ? { id: updated.id, token, date: generationDate } : null;
 };
 
+const persistNonPublishedAnalysisRun = async (data, validatedData, mode, publicationDate, reason) => {
+  const analyses = Array.isArray(data?.analysisResult?.analyses) ? data.analysisResult.analyses : [];
+  const auditPayload = {
+    ...data,
+    selectedEvents: [],
+    analysisResult: null,
+    generatedAnalyses: analyses,
+    selection: {
+      ...(data.selection || {}),
+      ...(validatedData?.selection || {}),
+      status: 'empty',
+      success: false,
+      analysesPublished: 0,
+      publicationBlocked: true,
+      error: reason,
+    },
+    success: false,
+    error: reason,
+  };
+  await run(
+    `INSERT INTO daily_analysis_publications
+     (analysis_date, match_mode, provider, cache_version, status, payload, error, generated_at, updated_at)
+     VALUES (?, ?, ?, ?, 'empty', ?::jsonb, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT (analysis_date, match_mode, provider, cache_version)
+     DO UPDATE SET status = 'empty', payload = EXCLUDED.payload, error = EXCLUDED.error,
+       generation_token = NULL, generated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP`,
+    [publicationDate, mode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, JSON.stringify(auditPayload), reason]
+  );
+  console.info('[API]', JSON.stringify({
+    stage: 'analyses_saved',
+    message: 'Analises salvas',
+    analysisRunId: data?.selection?.analysisRunId,
+    generatedAnalyses: analyses.length,
+    analysesPublished: 0,
+    status: 'empty',
+    reason,
+  }));
+};
+
 const publishDailyPick = async (claim, data, mode = 'prelive') => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
   const publicationDate = claim?.date || getLocalDateKey();
-  assertDailyPickPublication(data);
+  const finalValidation = filterDailyPickForPublication(data, publicationDate, { mode: matchMode });
+  for (const { event, reason } of finalValidation.discarded) {
+    console.warn('[DailyPickEligibility]', JSON.stringify({
+      decision: 'DESCARTADA',
+      reason,
+      stage: 'immediately_before_publication',
+      eventId: event?.id,
+    }));
+  }
+  if (matchMode === 'prelive' && finalValidation.data.selectedEvents.length === 0) {
+    const reason = 'Nenhuma partida aprovada pelo Decision Engine permanece em pre-jogo no momento da publicacao.';
+    await persistNonPublishedAnalysisRun(data, finalValidation.data, matchMode, publicationDate, reason);
+    throw new Error(reason);
+  }
+  data = finalValidation.data;
+  console.info('[DailyPickFlow]', JSON.stringify({
+    stage: 'final_validation',
+    mode: matchMode,
+    publicationDate,
+    selected: data.selectedEvents.length,
+    approved: (data.analysisResult?.analyses || []).filter(isUsableAnalysis).length,
+    publishable: data.selection?.analysesPublished || 0,
+    eligible: data.selection?.finalPreliveValidation?.eligible || 0,
+    discarded: data.selection?.finalPreliveValidation?.discarded || [],
+    error: data.error || data.selection?.error || null,
+  }));
+  assertDailyPickPublication(data, { date: publicationDate, mode: matchMode });
+  data = markPipelineReportsPublished(data);
   const payload = JSON.stringify(data);
   await run(
     `UPDATE daily_analysis_publications
@@ -1915,6 +2252,15 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
   await persistBookmakerOddsSnapshots(data).catch((err) => {
     console.warn('Nao foi possivel registrar snapshots de odds:', err.message);
   });
+  console.info('[DailyPickFlow]', JSON.stringify({
+    stage: 'persisted',
+    mode: matchMode,
+    publicationDate,
+    databaseStatus: 'published',
+    analysesPublished: data.selection?.analysesPublished || 0,
+    eligible: data.selection?.finalPreliveValidation?.eligible || 0,
+    error: null,
+  }));
   const runtimeCache = {
     cacheKey: getDailyPickCacheKey(matchMode, publicationDate),
     data,
@@ -1931,7 +2277,34 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
 const upsertPublishedDailyPick = async (data, mode = 'prelive', storageDate = null) => {
   const matchMode = normalizeMatchMode(mode || data?.matchMode);
   const publicationDate = storageDate || data?.selection?.analysisDate || getLocalDateKey();
-  assertDailyPickPublication(data);
+  const finalValidation = filterDailyPickForPublication(data, publicationDate, { mode: matchMode });
+  for (const { event, reason } of finalValidation.discarded) {
+    console.warn('[DailyPickEligibility]', JSON.stringify({
+      decision: 'DESCARTADA',
+      reason,
+      stage: 'immediately_before_publication',
+      eventId: event?.id,
+    }));
+  }
+  if (matchMode === 'prelive' && finalValidation.data.selectedEvents.length === 0) {
+    const reason = 'Nenhuma partida aprovada pelo Decision Engine permanece em pre-jogo no momento da publicacao.';
+    await persistNonPublishedAnalysisRun(data, finalValidation.data, matchMode, publicationDate, reason);
+    throw new Error(reason);
+  }
+  data = finalValidation.data;
+  console.info('[DailyPickFlow]', JSON.stringify({
+    stage: 'final_validation',
+    mode: matchMode,
+    publicationDate,
+    selected: data.selectedEvents.length,
+    approved: (data.analysisResult?.analyses || []).filter(isUsableAnalysis).length,
+    publishable: data.selection?.analysesPublished || 0,
+    eligible: data.selection?.finalPreliveValidation?.eligible || 0,
+    discarded: data.selection?.finalPreliveValidation?.discarded || [],
+    error: data.error || data.selection?.error || null,
+  }));
+  assertDailyPickPublication(data, { date: publicationDate, mode: matchMode });
+  data = markPipelineReportsPublished(data);
   const payload = JSON.stringify(data);
 
   await run(
@@ -1956,6 +2329,15 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive', storageDate = nu
   await persistBookmakerOddsSnapshots(data).catch((err) => {
     console.warn('Nao foi possivel registrar snapshots de odds:', err.message);
   });
+  console.info('[DailyPickFlow]', JSON.stringify({
+    stage: 'persisted',
+    mode: matchMode,
+    publicationDate,
+    databaseStatus: 'published',
+    analysesPublished: data.selection?.analysesPublished || 0,
+    eligible: data.selection?.finalPreliveValidation?.eligible || 0,
+    error: null,
+  }));
 
   const runtimeCache = {
     cacheKey: getDailyPickCacheKey(matchMode, publicationDate),
@@ -1972,6 +2354,7 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive', storageDate = nu
 const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false, date = null } = {}) => {
   const matchMode = normalizeMatchMode(mode);
   const storageDate = date || getLocalDateKey();
+  const analysisRunId = crypto.randomUUID();
   await settlePendingAnalysisPredictions().catch((err) => {
     console.warn('Liquidacao automatica de previsoes ignorada:', err.message);
   });
@@ -1983,8 +2366,22 @@ const generateAndPublishDailyPick = async ({ mode = 'prelive', force = false, da
     }
   }
 
-  const data = await fetchDailyAnalysis(matchMode, date);
+  const data = await fetchDailyAnalysis(matchMode, date, { fresh: force, analysisRunId });
+  console.info('[API]', JSON.stringify({
+    stage: 'publication_started',
+    message: 'Publicacao iniciada',
+    analysisRunId,
+    force,
+    approved: Number(data.selection?.approvedEntries || 0),
+  }));
   const published = await upsertPublishedDailyPick(data, matchMode, storageDate);
+  console.info('[API]', JSON.stringify({
+    stage: 'analyses_saved',
+    message: 'Analises salvas',
+    analysisRunId,
+    analysesPublished: Number(published.data?.selection?.analysesPublished || 0),
+    status: published.status,
+  }));
   return { ...published, reused: false };
 };
 
@@ -2279,6 +2676,14 @@ const requireInternalDailyPickSecret = (req, res, next) => {
   return next();
 };
 
+const asyncPublicationJobs = new Map();
+
+app.get('/api/internal/daily-pick/publication-jobs/:jobId', requireInternalDailyPickSecret, (req, res) => {
+  const job = asyncPublicationJobs.get(String(req.params.jobId || ''));
+  if (!job) return res.status(404).json({ error: 'Execucao de publicacao nao encontrada.' });
+  return res.json({ success: true, job });
+});
+
 app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, async (req, res) => {
   const requestedModes = Array.isArray(req.body?.modes)
     ? req.body.modes
@@ -2303,28 +2708,112 @@ app.post('/api/internal/daily-pick/publish', requireInternalDailyPickSecret, asy
     return res.status(400).json({ error: 'O modo live permite somente a data de hoje.' });
   }
 
-  try {
+  const executePublication = async () => {
     const results = [];
     for (const mode of modes) {
       const published = await generateAndPublishDailyPick({ mode, force, date: requestedDate });
-      results.push({
+      const selection = published.data?.selection || {};
+      const analysesPublished = Number(selection.analysesPublished || 0);
+      const eligible = Number(selection.finalPreliveValidation?.eligible ?? published.data?.selectedEvents?.length ?? 0);
+      const success = analysesPublished > 0 || eligible > 0;
+      const failureMessage = buildTriageFailureMessage({
+        pipeline: { report: selection.pipeline?.report },
+        matchesFound: selection.matchesFound,
+      }, selection.finalPreliveValidation?.discarded || []);
+      const result = {
         mode,
+        success,
         status: published.status,
+        jobStatus: success ? 'completed' : 'empty',
+        error: success ? null : selection.error || published.error || failureMessage,
         reused: Boolean(published.reused),
         updatedAt: published.updatedAt,
         selectedEvents: filterEventsForMode(published.data?.selectedEvents || [], mode).length,
         hasAnalysis: Boolean(published.data?.analysisResult),
-        selection: published.data?.selection || null,
-      });
+        analysesPublished,
+        eligible,
+        discarded: selection.finalPreliveValidation?.discarded || [],
+        pipelineReport: selection.pipeline?.report || null,
+        selection,
+      };
+      results.push(result);
+      console.info('[DailyPickFlow]', JSON.stringify({
+        stage: 'api_result',
+        ...result,
+        selection: undefined,
+      }));
     }
 
-    res.json({
-      success: true,
+    const analysesPublished = results.reduce((total, item) => total + item.analysesPublished, 0);
+    const eligible = results.reduce((total, item) => total + item.eligible, 0);
+    const success = analysesPublished > 0 || eligible > 0;
+    const aggregateFailure = results
+      .filter((item) => item.error)
+      .map((item) => `${item.mode}: ${item.error}`)
+      .join(' | ');
+    return {
+      success,
+      accepted: success,
+      tracked: false,
+      jobStatus: success ? 'completed' : 'empty',
+      error: success ? null : aggregateFailure || 'Nenhum modo de publicação recebeu partidas para avaliar.',
+      analysesPublished,
+      eligible,
+      discarded: results.flatMap((item) => item.discarded),
+      pipelineReports: results.map((item) => ({
+        mode: item.mode,
+        ...(item.pipelineReport || { summary: null, matches: [] }),
+      })),
       date: requestedDate || results[0]?.selection?.analysisDate || getLocalDateKey(),
       provider: getDailyPickProvider(),
       cacheVersion: DAILY_PICK_CACHE_VERSION,
       results,
+    };
+  };
+
+  if (req.query.async === 'true') {
+    const acceptedDate = requestedDate || getLocalDateKey();
+    const jobId = `daily-pick-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    asyncPublicationJobs.set(jobId, {
+      jobId,
+      status: 'processing',
+      date: acceptedDate,
+      modes,
+      force,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     });
+    void executePublication()
+      .then((result) => {
+        asyncPublicationJobs.set(jobId, {
+          ...asyncPublicationJobs.get(jobId),
+          status: 'completed',
+          result,
+          updatedAt: new Date().toISOString(),
+        });
+      })
+      .catch((err) => {
+        console.error('Erro na publicacao diaria assincrona:', err.message);
+        asyncPublicationJobs.set(jobId, {
+          ...asyncPublicationJobs.get(jobId),
+          status: 'failed',
+          error: err.message || 'Erro ao publicar analise diaria.',
+          updatedAt: new Date().toISOString(),
+        });
+      });
+    setTimeout(() => asyncPublicationJobs.delete(jobId), 60 * 60 * 1000).unref();
+    return res.status(202).json({
+      success: true,
+      accepted: true,
+      jobId,
+      date: acceptedDate,
+      modes,
+      force,
+    });
+  }
+
+  try {
+    res.json(await executePublication());
   } catch (err) {
     console.error('Erro ao publicar analise diaria manualmente:', err.message);
     res.status(500).json({ error: err.message || 'Erro ao publicar analise diaria.' });
@@ -2819,7 +3308,10 @@ const toAnalysisCenterEntry = (entry, events = []) => {
     awayTeam,
     homeTeamName: homeTeam.name,
     awayTeamName: awayTeam.name,
-    tournamentName: sanitizeProviderText(event?.tournament?.name || entry.tournamentName, ''),
+    tournamentName: sanitizeTournamentName(
+      entry.tournamentName,
+      sanitizeTournamentName(event?.tournament?.name, ''),
+    ),
     startTimestamp: event?.startTimestamp || entry.startTimestamp || null,
     round: event?.round ?? event?.roundInfo?.round ?? entry.round ?? null,
     venue: event?.venue?.name && !/^unknown$/i.test(String(event.venue.name))
