@@ -25,6 +25,7 @@ const { buildBacktestReport, buildOddsProviderReliability, buildWeightRecommenda
 const { validateManualPublicationDate } = require('./services/analysisDate');
 const { auditDailyEvents, filterDailyPickForPublication, markPipelineReportsPublished } = require('./services/dailyEventEligibility');
 const { assertDailyPickPublication } = require('./services/dailyPickContract');
+const { buildUserAnalysisSummary } = require('./services/analysisSummary');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
 const { paymentBelongsToSession } = require('./services/paymentSession');
@@ -680,6 +681,12 @@ const normalizeEntry = (entry, events = []) => {
   const entryEventId = entry.eventId || (events.length === 1 ? events[0]?.id : null);
   const matchedEvent = events.find((event) => String(event.id) === String(entryEventId));
   const fullRationale = String(entry.rationale || '').trim();
+  const homeTeamName = sanitizeProviderText(matchedEvent?.homeTeam?.name || entry.homeTeamName, 'Casa');
+  const awayTeamName = sanitizeProviderText(matchedEvent?.awayTeam?.name || entry.awayTeamName, 'Fora');
+  const analysisSummary = buildUserAnalysisSummary(entry, {
+    homeName: homeTeamName,
+    awayName: awayTeamName,
+  });
   const liveMinute = getLiveMinute(matchedEvent) || entry.liveMinute || null;
   const statusType = String(matchedEvent?.status?.type || entry.status?.type || '').toLowerCase();
 
@@ -689,7 +696,7 @@ const normalizeEntry = (entry, events = []) => {
     odd: extractOdd(entry),
     fullRationale,
     rationale: summarizeText(fullRationale),
-    analysisSummary: summarizeText(fullRationale),
+    analysisSummary,
     advancedAnalysis: {
       matchAnalysis: entry.matchAnalysis || null,
       dataCoverage: entry.dataCoverage || null,
@@ -704,8 +711,8 @@ const normalizeEntry = (entry, events = []) => {
       warningSigns: Array.isArray(entry.warningSigns) ? entry.warningSigns : [],
       riskLevel: entry.riskLevel || null,
     },
-    homeTeamName: sanitizeProviderText(matchedEvent?.homeTeam?.name || entry.homeTeamName, 'Casa'),
-    awayTeamName: sanitizeProviderText(matchedEvent?.awayTeam?.name || entry.awayTeamName, 'Fora'),
+    homeTeamName,
+    awayTeamName,
     homeTeamImageUrl: getTeamImageUrl(matchedEvent?.homeTeam) || entry.homeTeamImageUrl || entry.homeTeam?.imageUrl || null,
     awayTeamImageUrl: getTeamImageUrl(matchedEvent?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
     tournamentName: sanitizeTournamentName(
@@ -3304,6 +3311,10 @@ const toAnalysisCenterEntry = (entry, events = []) => {
     imageUrl: getTeamImageUrl(event?.awayTeam) || entry.awayTeamImageUrl || entry.awayTeam?.imageUrl || null,
   };
   const rationale = entry.fullRationale || entry.rationale || entry.analysisSummary || '';
+  const analysisSummary = buildUserAnalysisSummary(entry, {
+    homeName: homeTeam.name,
+    awayName: awayTeam.name,
+  });
 
   return {
     ...entry,
@@ -3323,6 +3334,7 @@ const toAnalysisCenterEntry = (entry, events = []) => {
       : entry.venue || null,
     status: event?.status || entry.status || null,
     rationale,
+    analysisSummary,
     matchAnalysis: entry.matchAnalysis || rationale,
     bestEntry: {
       ...entry,
@@ -3330,6 +3342,7 @@ const toAnalysisCenterEntry = (entry, events = []) => {
       homeTeam,
       awayTeam,
       rationale,
+      analysisSummary,
     },
   };
 };
