@@ -31,9 +31,11 @@ function safeEqual(left, right) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function cookieOptions() {
-  const production = process.env.NODE_ENV === 'production';
-  const configuredSameSite = String(process.env.AUTH_COOKIE_SAME_SITE || (production ? 'none' : 'lax')).toLowerCase();
+function cookieOptions(env = process.env) {
+  const production = env.NODE_ENV === 'production';
+  // A sessão é entregue pelo proxy same-origin da Vercel. Lax evita depender
+  // de cookies de terceiros, bloqueados principalmente pelo Safari/iOS.
+  const configuredSameSite = String(env.AUTH_COOKIE_SAME_SITE || 'lax').toLowerCase();
   const sameSite = ['strict', 'lax', 'none'].includes(configuredSameSite) ? configuredSameSite : 'lax';
   return {
     httpOnly: true,
@@ -41,6 +43,7 @@ function cookieOptions() {
     sameSite,
     path: '/',
     maxAge: SESSION_HOURS * 60 * 60 * 1000,
+    priority: 'high',
   };
 }
 
@@ -114,6 +117,7 @@ async function requireAdmin(req, res, next) {
 module.exports = {
   authenticateToken,
   clearSessionCookie,
+  cookieOptions,
   csrfForSession,
   issueSessionToken,
   sessionHours: SESSION_HOURS,
