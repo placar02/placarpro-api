@@ -3039,20 +3039,12 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60_000, max: 8, prefix: '
 
     const userRole = user.role || (user.plano === 'premium' ? 'premium' : 'free');
     const sessionId = crypto.randomUUID();
-    const sessionResult = await transaction(async (tx) => {
+    await transaction(async (tx) => {
       await tx.get('SELECT id FROM users WHERE id = ? FOR UPDATE', [user.id]);
       await tx.run('UPDATE user_sessions SET revoked = TRUE WHERE user_id = ? AND expires_at <= CURRENT_TIMESTAMP', [user.id]);
-      const accessSettings = await tx.get('SELECT max_accesses FROM payment_settings WHERE id = 1');
-      const maxAccesses = Number(accessSettings?.max_accesses || 1);
-      const activeSessions = await tx.get('SELECT COUNT(*)::int total FROM user_sessions WHERE user_id = ? AND revoked = FALSE AND expires_at > CURRENT_TIMESTAMP', [user.id]);
-      if (Number(activeSessions?.total || 0) >= maxAccesses) return { allowed: false, maxAccesses };
       await tx.run('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?', [user.id]);
       await tx.run("INSERT INTO user_sessions (id, user_id, expires_at) VALUES (?, ?, CURRENT_TIMESTAMP + (? * interval '1 hour'))", [sessionId, user.id, sessionHours]);
-      return { allowed: true, maxAccesses };
     });
-    if (!sessionResult.allowed) {
-      return res.status(403).json({ error: `Limite de ${sessionResult.maxAccesses} acesso(s) simultaneo(s) atingido.` });
-    }
     const token = issueSessionToken({ id: user.id, email: user.email, role: userRole }, sessionId);
     setSessionCookie(res, token);
     res.json({
