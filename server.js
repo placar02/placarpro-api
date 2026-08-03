@@ -29,6 +29,7 @@ const { buildUserAnalysisSummary } = require('./services/analysisSummary');
 const logger = require('./services/logger');
 const { verifyMercadoPagoSignature } = require('./services/mercadoPagoWebhook');
 const { paymentBelongsToSession } = require('./services/paymentSession');
+const { buildMercadoPagoPixPayer, resolveMercadoPagoPayerEmail } = require('./services/paymentPayer');
 const { rateLimit, requestTimeout, slowDown } = require('./middlewares/security');
 const { cleanText, strongPassword, validateAuth } = require('./validators/publicValidators');
 
@@ -991,25 +992,6 @@ const getMercadoPagoErrorDetails = (err) => {
   };
 };
 
-const sanitizeMercadoPagoPayload = (payload = {}) => ({
-  transaction_amount: payload.transaction_amount,
-  description: payload.description,
-  installments: payload.installments,
-  payment_method_id: payload.payment_method_id,
-  issuer_id: payload.issuer_id,
-  external_reference: payload.external_reference,
-  payer: payload.payer ? {
-    email: payload.payer.email,
-    identification: payload.payer.identification ? {
-      type: payload.payer.identification.type,
-      number: payload.payer.identification.number ? '***' : undefined,
-    } : undefined,
-  } : undefined,
-  metadata: payload.metadata,
-  has_token: Boolean(payload.token),
-  has_notification_url: Boolean(payload.notification_url),
-});
-
 const paymentAuditSnapshot = (payment = {}) => JSON.stringify({
   id: payment.id,
   status: payment.status,
@@ -1127,13 +1109,6 @@ const isMercadoPagoTestMode = () => (
   String(process.env.MERCADOPAGO_ACCESS_TOKEN || '').startsWith('TEST-')
   || String(process.env.MERCADOPAGO_PUBLIC_KEY || '').startsWith('TEST-')
 );
-
-const getMercadoPagoPayerEmail = (preferredEmail, fallbackEmail) => {
-  const testBuyerEmail = String(process.env.MERCADOPAGO_TEST_BUYER_EMAIL || '').trim();
-  if (isMercadoPagoTestMode() && testBuyerEmail) return testBuyerEmail;
-
-  return preferredEmail || fallbackEmail;
-};
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -3827,10 +3802,13 @@ app.post('/api/payments/checkout', authenticateToken, async (req, res) => {
       description: plan.name || process.env.MERCADOPAGO_PREMIUM_PRODUCT_DESCRIPTION || 'Acesso premium ao PlacarPro',
       payment_method_id: 'pix',
       external_reference: externalId,
-      payer: {
-        email: user?.email || req.user.email,
-        first_name: user?.nome || undefined,
-      },
+      payer: buildMercadoPagoPixPayer({
+        authenticatedEmail: user?.email,
+        sessionEmail: req.user.email,
+        testBuyerEmail: process.env.MERCADOPAGO_TEST_BUYER_EMAIL,
+        testMode: isMercadoPagoTestMode(),
+        firstName: user?.nome,
+      }),
       metadata: {
         userId: String(req.user.id),
         plan: plan.slug || 'premium',
@@ -3913,7 +3891,13 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
     const notificationUrl = getPaymentNotificationUrl();
     const user = await get('SELECT email, nome FROM users WHERE id = ?', [req.user.id]);
     const payer = {
-      email: getMercadoPagoPayerEmail(cardholderEmail, user?.email || req.user.email),
+      email: resolveMercadoPagoPayerEmail({
+        authenticatedEmail: user?.email,
+        sessionEmail: req.user.email,
+        submittedEmail: cardholderEmail,
+        testBuyerEmail: process.env.MERCADOPAGO_TEST_BUYER_EMAIL,
+        testMode: isMercadoPagoTestMode(),
+      }),
     };
 
     if (identificationType && identificationNumber) {
@@ -3942,8 +3926,6 @@ app.post('/api/payments/card', authenticateToken, async (req, res) => {
       paymentPayload.issuer_id = issuerId;
     }
     if (notificationUrl) paymentPayload.notification_url = notificationUrl;
-
-    console.info('Payload Mercado Pago cartao:', sanitizeMercadoPagoPayload(paymentPayload));
 
     await reserveCoupon({ couponId: coupon?.id, userId: req.user.id, externalId });
     let payment;
