@@ -1747,13 +1747,14 @@ const persistLegacyDailyPickCache = async (data, mode = 'prelive', storageDate =
   const publicationDate = storageDate || data?.selection?.analysisDate || getLocalDateKey();
   const cacheKey = getDailyPickCacheKey(mode, publicationDate);
   const payload = JSON.stringify(data);
-  const existing = await get('SELECT id FROM ai_analysis_cache WHERE cache_key = ?', [cacheKey]);
-
-  if (existing) {
-    await run('UPDATE ai_analysis_cache SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE cache_key = ?', [payload, cacheKey]);
-  } else {
-    await run('INSERT INTO ai_analysis_cache (cache_key, payload) VALUES (?, ?)', [cacheKey, payload]);
-  }
+  await run(
+    `INSERT INTO ai_analysis_cache (cache_key, payload, updated_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT (cache_key) DO UPDATE SET
+       payload = EXCLUDED.payload,
+       updated_at = CURRENT_TIMESTAMP`,
+    [cacheKey, payload]
+  );
 };
 
 const persistAnalysisPredictions = async (data, mode = 'prelive') => {
@@ -2231,7 +2232,9 @@ const publishDailyPick = async (claim, data, mode = 'prelive') => {
      WHERE id = ? AND generation_token = ?`,
     [payload, claim.id, claim.token]
   );
-  await persistLegacyDailyPickCache(data, matchMode, publicationDate);
+  await persistLegacyDailyPickCache(data, matchMode, publicationDate).catch((err) => {
+    console.warn('Cache legado da publicacao nao foi atualizado:', err.message);
+  });
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
   });
@@ -2308,7 +2311,9 @@ const upsertPublishedDailyPick = async (data, mode = 'prelive', storageDate = nu
     [publicationDate, matchMode, getDailyPickProvider(), DAILY_PICK_CACHE_VERSION, payload]
   );
 
-  await persistLegacyDailyPickCache(data, matchMode, publicationDate);
+  await persistLegacyDailyPickCache(data, matchMode, publicationDate).catch((err) => {
+    console.warn('Cache legado da publicacao nao foi atualizado:', err.message);
+  });
   await persistAnalysisPredictions(data, matchMode).catch((err) => {
     console.warn('Nao foi possivel registrar previsoes da publicacao:', err.message);
   });

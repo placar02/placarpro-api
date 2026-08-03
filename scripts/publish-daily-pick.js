@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { validateAnalysisDate } = require('../services/analysisDate');
+const { isTransientPublicationPollError } = require('../services/publicationPolling');
 
 const DEFAULT_BASE_URL = `http://localhost:${process.env.PORT || 3000}`;
 
@@ -128,7 +129,7 @@ async function waitForPublication(jobId, date) {
         throw new Error(job.error || `Publicacao de ${date} falhou.`);
       }
     } catch (error) {
-      if (!/fetch failed|timeout|aborted|ECONNREFUSED/i.test(error.message)) throw error;
+      if (!isTransientPublicationPollError(error)) throw error;
       lastStatus = error.message;
     }
     process.stdout.write(`Aguardando publicacao de ${date} (${lastStatus})...\n`);
